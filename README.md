@@ -281,5 +281,3 @@ Arc::new(Mutex::new(Box::new(
 ```
 
 Or leave the Mock in place and let the **Watchdog** discover and connect the real device automatically once the cable is plugged in.
-#   J D S 6 6 0 0 _ s e r v e r  
- 

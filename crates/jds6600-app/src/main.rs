@@ -160,8 +160,9 @@ mod sleep_inhibit {
     pub fn enable() {
         #[cfg(target_os = "windows")]
         unsafe {
-            use winapi::um::winbase::{
-                SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED,
+            use winapi::um::winbase::SetThreadExecutionState;
+            use winapi::um::winnt::{
+                ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED,
             };
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
             tracing::info!("[SLEEP] SetThreadExecutionState applied");
