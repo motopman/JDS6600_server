@@ -1,0 +1,19 @@
+[package]
+name = "jds6600-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core logic for the JDS6600 remote-control server (no GUI)"
+# Minimum supported Rust version: 1.75
+rust-version = "1.75"
+
+[dependencies]
+tokio        = { version = "1.36", features = ["full"] }
+axum         = { version = "0.7",  features = ["ws"] }
+tower-http   = { version = "0.5",  features = ["cors"] }
+serde        = { version = "1",    features = ["derive"] }
+serde_json   = "1"
+serialport   = "4"
+tracing      = "0.1"
+thiserror    = "1"
+anyhow       = "1"
+futures-util = "0.3"

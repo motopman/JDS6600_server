@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/jds6600-core",
+    "crates/jds6600-app",
+    "crates/jdsctl",
+]
+resolver = "2"

@@ -1,0 +1,40 @@
+[package]
+name = "jds6600-app"
+version = "0.1.0"
+edition = "2021"
+description = "GUI wrapper with system tray and QR code window for the JDS6600 server"
+# NOTE: eframe / tray-icon require Rust >= 1.80 and Cargo edition2024 transitive deps.
+# Build with: rustup update stable && cargo build -p jds6600-app
+rust-version = "1.80"
+
+[[bin]]
+name = "jds6600-app"
+path = "src/main.rs"
+
+[dependencies]
+jds6600-core = { path = "../jds6600-core" }
+
+# GUI
+eframe = "0.27"
+egui   = "0.27"
+
+# Tray icon (from the Tauri project – natively supports Win/macOS/Linux)
+tray-icon = "0.14"
+
+# QR code + image processing
+qrcode = "0.13"
+image  = "0.24"
+
+# Async runtime (re-used from core, but we need the builder here)
+tokio = { version = "1.36", features = ["full"] }
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Network utility
+local-ip-address = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+# For SetThreadExecutionState (prevent sleep) on Windows
+winapi = { version = "0.3", features = ["winbase", "winnt", "minwindef"] }
