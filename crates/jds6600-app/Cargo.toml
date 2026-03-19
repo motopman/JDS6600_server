@@ -18,6 +18,7 @@ egui   = "0.27"
 
 # Tray icon (from the Tauri project – natively supports Win/macOS/Linux)
 tray-icon = "0.14"
+crossbeam-channel = "0.5"
 
 # QR code + image processing
 qrcode = "0.13"

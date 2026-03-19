@@ -85,7 +85,7 @@ fn main() -> eframe::Result<()> {
             .expect("Backend thread failed");
     }
 
-    let (_tray, tray_controller) = tray::create();
+    let tray_controller = tray::create();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

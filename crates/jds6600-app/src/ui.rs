@@ -36,7 +36,7 @@ use jds6600_core::{
     protocol::commands::GeneratorCommand,
 };
 
-use crate::tray::TrayController;
+use crate::tray::{TrayController, TrayEvent};
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -94,14 +94,11 @@ pub struct ServerApp {
 
 impl ServerApp {
     pub fn new(
-        cc:       &eframe::CreationContext<'_>,
+        _cc:      &eframe::CreationContext<'_>,
         ws_url:   String,
         tray:     TrayController,
         quick_tx: QuickCmdSender,
     ) -> Self {
-        // Register the egui context immediately so the tray thread can wake
-        // eframe as soon as the first event arrives.
-        tray.register_egui_ctx(cc.egui_ctx.clone());
         Self {
             ws_url,
             qr_texture:       None,
@@ -165,32 +162,53 @@ impl ServerApp {
 
 impl eframe::App for ServerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // TrayController::apply() reads the AtomicBool set by the tray thread,
-        // applies Visible()/Focus viewport commands, and updates the menu label.
-        // This is the ONLY place visibility is mutated from the egui side.
-        self.visible = self.tray.apply(ctx, self.visible);
-
-        // Intercept the window ✕ button: hide rather than quit.
-        if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.tray.set_hidden();     // keep AtomicBool in sync
-            self.visible = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // ── 1. Drain tray events ──────────────────────────────────────────
+        // The tray thread delivers events over a crossbeam channel.
+        // We process ALL pending events before doing anything else.
+        // update() NEVER returns early — viewport commands must be issued
+        // every frame regardless of visibility.
+        for ev in self.tray.drain() {
+            match ev {
+                TrayEvent::Toggle => {
+                    self.visible = !self.visible;
+                }
+                TrayEvent::Quit => {
+                    std::process::exit(0);
+                }
+            }
         }
 
-        if !self.visible { return; }
+        // ── 2. Intercept window ✕ button — hide, do not quit ─────────────
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.visible = false;
+        }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    render_header(ui, ctx, self);
-                    sep(ui);
-                    render_controls(ui, self);
-                    sep(ui);
-                    render_log(ui, self);
-                });
-        });
+        // ── 3. Apply visibility and focus every frame ─────────────────────
+        // Always issue these commands — eframe drops them when redundant.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.visible));
+        if self.visible {
+            // Focus is safe to issue every frame; eframe only acts on changes.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+
+        // ── 4. Update tray menu label ─────────────────────────────────────
+        self.tray.update_label(self.visible);
+
+        // ── 5. Render (only when visible, but update() does NOT return) ───
+        if self.visible {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        render_header(ui, ctx, self);
+                        sep(ui);
+                        render_controls(ui, self);
+                        sep(ui);
+                        render_log(ui, self);
+                    });
+            });
+        }
     }
 }
 
@@ -219,11 +237,7 @@ fn render_header(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut ServerApp) {
         ui.label(RichText::new("● Server running")
             .color(egui::Color32::from_rgb(55, 210, 55)).strong());
         ui.add_space(6.0);
-        if ui.button("  Minimize to Tray  ").clicked() {
-                app.tray.set_hidden();
-                app.visible = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            }
+        if ui.button("  Minimize to Tray  ").clicked() { app.visible = false; }
         ui.add_space(4.0);
     });
 }
