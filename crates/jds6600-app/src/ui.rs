@@ -23,7 +23,6 @@
 //! channel matches that value.  Channel and Output buttons reflect global
 //! state.  State is never read from hardware – only what WE sent is tracked.
 
-use std::time::Duration;
 
 use eframe::egui::{self, ColorImage, FontId, RichText, TextureHandle, TextureOptions};
 use qrcode::QrCode;
@@ -34,7 +33,7 @@ use jds6600_core::{
     protocol::commands::GeneratorCommand,
 };
 
-use crate::tray::{TrayController, TrayEvent};
+use crate::tray::TrayController;
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -76,8 +75,6 @@ struct ChannelSent {
 pub struct ServerApp {
     ws_url:      String,
     qr_texture:  Option<TextureHandle>,
-    /// Current window visibility state — source of truth for eframe.
-    visible:     bool,
     tray:        TrayController,
     quick_tx:    QuickCmdSender,
 
@@ -95,8 +92,6 @@ pub struct ServerApp {
     hw_detail:      String,        // "COM4" or "scanning 3 ports…"
     // Command log
     log: Vec<String>,
-    /// Tracks the previous visibility so we only send Focus/label on transitions.
-    prev_visible: bool,
 }
 
 impl ServerApp {
@@ -110,7 +105,6 @@ impl ServerApp {
         Self {
             ws_url,
             qr_texture:       None,
-            visible:          true,
             tray,
             quick_tx,
             selected_channel: 1,
@@ -122,7 +116,6 @@ impl ServerApp {
             hw_connected:     false,
             hw_detail:        "searching for generator…".into(),
             log:              Vec::new(),
-            prev_visible:     true,
         }
     }
 
@@ -294,36 +287,22 @@ impl eframe::App for ServerApp {
         // ── 1. Drain mobile events ───────────────────────────────────────
         self.drain_mobile();
 
-        // ── 2. Tray events ────────────────────────────────────────────────
-        while let Some(ev) = self.tray.try_recv() {
-            match ev {
-                TrayEvent::Toggle => { self.visible = !self.visible; }
-                TrayEvent::Quit   => { std::process::exit(0); }
-            }
-        }
+        // Sync menu item enabled/disabled state (must run on egui/main thread
+        // because MenuItem contains Rc<> which is not Send).
+        self.tray.apply_menu_state();
 
-        // ── 3. Window ✕ → hide to tray ───────────────────────────────────
+        // ── 2. Window ✕ → hide to tray (OS callbacks handle menu/icon) ───
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.visible = false;
+            self.tray.hide(ctx);  // sets AtomicBool + Visible(false) + repaint
         }
 
-        // ── 4. Sync viewport visibility ───────────────────────────────────
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.visible));
-
-        // ── 5. Update tray label on state change ──────────────────────────
-        if self.visible != self.prev_visible {
-            self.tray.update_label(self.visible);
-            self.prev_visible = self.visible;
-        }
-
-        // ── 6. When hidden: keep the event loop alive, skip rendering ─────
-        if !self.visible {
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        // ── 3. When hidden: skip rendering (OS callbacks handle restore) ──
+        if self.tray.is_hidden() {
             return;
         }
 
-        // ── 7. Render ─────────────────────────────────────────────────────
+        // ── 4. Render ─────────────────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -371,7 +350,7 @@ fn render_header(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut ServerApp) {
         };
         ui.label(RichText::new(format!("{dot}  {hw_msg}")).strong().color(color));
         ui.add_space(6.0);
-        if ui.button("  Minimize to Tray  ").clicked() { app.visible = false; }
+        if ui.button("  Minimize to Tray  ").clicked() { app.tray.hide(ctx); }
         ui.add_space(4.0);
     });
 }

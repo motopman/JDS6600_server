@@ -1,128 +1,126 @@
-//! System tray — production-grade implementation.
+//! System tray — OS-callback architecture, corrected for Send+Sync.
 //!
-//! # Architecture
+//! ## Why MenuItem cannot go into set_event_handler callbacks
 //!
-//! ```text
-//! ┌─ Tray OS Thread ──────────────────────────────────────────────────────┐
-//! │  MenuEvent::receiver().recv()   ← BLOCKING, zero CPU, zero latency   │
-//! │  ├─ Toggle → tx.send(TrayEvent::Toggle)                              │
-//! │  └─ Quit   → tx.send(TrayEvent::Quit)                                │
-//! └───────────────────────────────────────────────────────────────────────┘
-//!           │
-//!    crossbeam_channel
-//!           │
-//! ┌─ egui Main Thread ────────────────────────────────────────────────────┐
-//! │  App::update()                                                        │
-//! │    tray.drain() → Vec<TrayEvent>                                      │
-//! │    for ev in events {                                                 │
-//! │      Toggle → visible = !visible                                      │
-//! │      Quit   → std::process::exit(0)                                  │
-//! │    }                                                                  │
-//! │    ViewportCommand::Visible(visible)                                  │
-//! │    if visible { ViewportCommand::Focus }                              │
-//! │    // render panel only when visible — but update() NEVER returns    │
-//! └───────────────────────────────────────────────────────────────────────┘
-//! ```
+//! `MenuItem` internally holds `Rc<MenuId>` (non-Send, non-Sync).
+//! `set_event_handler` requires `F: Send + Sync + 'static`.
 //!
-//! ## Key properties
-//! | Property               | Guarantee |
-//! |------------------------|-----------|
-//! | Quit works always      | ✓ — tray thread calls exit(0) directly |
-//! | Show/Hide always works | ✓ — event delivered over channel |
-//! | Zero CPU when idle     | ✓ — blocking recv, no polling |
-//! | No thread_local        | ✓ |
-//! | No shared mutable state| ✓ — channel is the only bridge |
-//! | update() never returns | ✓ — viewport cmd applied every frame |
-//! | Typed events           | ✓ — TrayEvent enum |
+//! Solution: the callbacks capture only Send+Sync values:
+//!   • `MenuId`  — a plain u32 wrapper, Copy
+//!   • `Arc<AtomicBool>` — Send+Sync
+//!   • `egui::Context`  — Clone+Send+Sync
 //!
-//! ## Why blocking `recv()` in the tray thread
-//! `try_recv()` + sleep is a polling anti-pattern: it either wastes CPU or
-//! adds latency.  `MenuEvent::receiver().recv()` blocks until an event
-//! arrives, consumes zero CPU while idle, and delivers events with OS-level
-//! latency (~1 ms).
-//!
-//! ## Why `TrayController` owns the `TrayIcon`
-//! `TrayIcon` must stay alive for the lifetime of the application.  Owning it
-//! inside `TrayController` (which is owned by `ServerApp`) guarantees the
-//! lifetime without any external binding in `main()`.
-//!
-//! ## Why `std::process::exit(0)` in the tray thread, not via an event
-//! Quit is the one action that must work even if the eframe event loop is
-//! suspended.  Sending a `Quit` event and handling it in `update()` is also
-//! correct — we do both: the tray thread sends the event AND the handler
-//! calls `exit(0)`.  Either path guarantees termination.
+//! `MenuItem::set_enabled()` is called from `TrayController::apply()`,
+//! which runs on the egui main thread every frame — no threading needed.
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
-use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, MenuId},
-    Icon, TrayIcon, TrayIconBuilder,
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
-// ── Event type ────────────────────────────────────────────────────────────
-
-/// Typed events sent from the tray OS thread to the egui main thread.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrayEvent {
-    /// Toggle window visibility.
-    Toggle,
-    /// Quit the application.
-    Quit,
-}
+use tray_icon::{
+    menu::{Menu, MenuEvent, MenuItem, MenuId, PredefinedMenuItem},
+    Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
+};
 
 // ── TrayController ────────────────────────────────────────────────────────
 
-/// Owned by `ServerApp`.  Provides `drain()` to pull tray events each frame
-/// and `update_label()` to keep the menu item text in sync.
 pub struct TrayController {
-    /// Receiving end of the event channel.
-    rx:         Receiver<TrayEvent>,
-    /// Kept so we can call `set_text()` to keep the label accurate.
-    show_item:  MenuItem,
-    /// Held here so it lives as long as the app.
-    _tray:      TrayIcon,
+    is_hidden:    Arc<AtomicBool>,
+    hide_item:    MenuItem,
+    restore_item: MenuItem,
+    _tray:        TrayIcon,
 }
 
 impl TrayController {
-    /// Non-blocking: return one pending event, or `None` if none.
-    /// Call in a loop at the top of `update()` — zero heap allocation.
-    pub fn try_recv(&self) -> Option<TrayEvent> {
-        self.rx.try_recv().ok()
+    /// True when window should be hidden.
+    pub fn is_hidden(&self) -> bool {
+        self.is_hidden.load(Ordering::SeqCst)
     }
 
-    /// Update the context-menu label to reflect what clicking WILL do.
-    /// Call after computing the new `visible` state each frame.
-    pub fn update_label(&self, visible: bool) {
-        self.show_item.set_text(if visible { "Hide Window" } else { "Show Window" });
+    /// Sync menu item enabled state to current visibility.
+    /// Call once per frame from `update()` — runs on the egui main thread,
+    /// so `MenuItem` (non-Send) is safe to call here.
+    pub fn apply_menu_state(&self) {
+        let hidden = self.is_hidden.load(Ordering::SeqCst);
+        self.hide_item.set_enabled(!hidden);
+        self.restore_item.set_enabled(hidden);
+    }
+
+    /// Hide the window — called from the in-window Minimize button or ✕.
+    pub fn hide(&self, ctx: &eframe::egui::Context) {
+        self.is_hidden.store(true, Ordering::SeqCst);
+        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(false));
+        ctx.request_repaint();
     }
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────
 
-/// Create the system tray icon and start the event thread.
-///
-/// **Must be called from the OS main thread** (macOS / Windows requirement).
-///
-/// Returns a `TrayController` that must be moved into `ServerApp::new()`.
-/// The `TrayIcon` is owned by the controller — no external binding needed.
-pub fn create() -> TrayController {
+pub fn create(ctx: eframe::egui::Context) -> TrayController {
     let icon = Icon::from_rgba(draw_icon(32), 32, 32)
         .expect("Tray icon pixel data invalid");
 
-    let menu      = Menu::new();
-    let show_item = MenuItem::new("Hide Window", true, None);  // starts visible
-    let quit_item = MenuItem::new("Quit",        true, None);
-    menu.append(&show_item).unwrap();
+    let menu         = Menu::new();
+    let hide_item    = MenuItem::new("Hide Window", true,  None);
+    let restore_item = MenuItem::new("Restore",     false, None);
+    let quit_item    = MenuItem::new("Quit",        true,  None);
+
+    menu.append(&hide_item).unwrap();
+    menu.append(&restore_item).unwrap();
+    menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&quit_item).unwrap();
 
-    let (tx, rx): (Sender<TrayEvent>, Receiver<TrayEvent>) = unbounded();
+    let is_hidden = Arc::new(AtomicBool::new(false));
 
-    let show_id: MenuId = show_item.id().clone();
-    let quit_id: MenuId = quit_item.id().clone();
+    // Only Send+Sync values go into the callbacks:
+    // MenuId (Copy), Arc<AtomicBool>, egui::Context
+    let hide_id    = hide_item.id().clone();
+    let restore_id = restore_item.id().clone();
+    let quit_id    = quit_item.id().clone();
 
-    // Spawn the dedicated tray event thread.
-    // This thread blocks on MenuEvent::receiver().recv() — zero CPU, zero
-    // latency.  It has NO dependency on the egui frame loop.
-    spawn_event_thread(tx, show_id, quit_id);
+    // ── Menu event handler ─────────────────────────────────────────────────
+    {
+        let ctx2      = ctx.clone();
+        let is_hidden2 = Arc::clone(&is_hidden);
+
+        MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
+            if ev.id == hide_id {
+                is_hidden2.store(true, Ordering::SeqCst);
+                ctx2.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(false));
+                ctx2.request_repaint();
+
+            } else if ev.id == restore_id {
+                is_hidden2.store(false, Ordering::SeqCst);
+                ctx2.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+                ctx2.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+                ctx2.request_repaint();
+
+            } else if ev.id == quit_id {
+                // ViewportCommand::Close silently fails when window is hidden.
+                std::process::exit(0);
+            }
+        }));
+    }
+
+    // ── Tray icon click handler ────────────────────────────────────────────
+    {
+        let ctx3       = ctx.clone();
+        let is_hidden3 = Arc::clone(&is_hidden);
+
+        TrayIconEvent::set_event_handler(Some(move |ev: TrayIconEvent| {
+            if let TrayIconEvent::Click { .. } = ev {
+                let was_hidden = is_hidden3.load(Ordering::SeqCst);
+                let now_hidden = !was_hidden;
+                is_hidden3.store(now_hidden, Ordering::SeqCst);
+                ctx3.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(!now_hidden));
+                if !now_hidden {
+                    ctx3.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+                }
+                ctx3.request_repaint();
+            }
+        }));
+    }
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -131,41 +129,7 @@ pub fn create() -> TrayController {
         .build()
         .expect("Failed to create tray icon");
 
-    TrayController { rx, show_item, _tray: tray }
-}
-
-// ── Tray event thread ─────────────────────────────────────────────────────
-
-fn spawn_event_thread(
-    tx:      Sender<TrayEvent>,
-    show_id: MenuId,
-    quit_id: MenuId,
-) {
-    std::thread::Builder::new()
-        .name("jds-tray-events".into())
-        .spawn(move || {
-            loop {
-                // BLOCKING recv — zero CPU while idle, OS-level latency.
-                // This is the correct pattern: no polling, no sleep().
-                match MenuEvent::receiver().recv() {
-                    Ok(ev) => {
-                        if ev.id == show_id {
-                            let _ = tx.send(TrayEvent::Toggle);
-                        } else if ev.id == quit_id {
-                            // Single shutdown path: event goes to update(),
-                            // which calls exit(0).  If egui is sleeping,
-                            // the send succeeds and egui wakes on next frame.
-                            let _ = tx.send(TrayEvent::Quit);
-                        }
-                    }
-                    Err(_) => {
-                        // MenuEvent channel closed — process is shutting down.
-                        break;
-                    }
-                }
-            }
-        })
-        .expect("Failed to spawn tray event thread");
+    TrayController { is_hidden, hide_item, restore_item, _tray: tray }
 }
 
 // ── Procedural icon ────────────────────────────────────────────────────────
@@ -173,36 +137,23 @@ fn spawn_event_thread(
 fn draw_icon(size: u32) -> Vec<u8> {
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     let center   = size as f32 / 2.0;
-
     for y in 0..size {
         for x in 0..size {
             let i  = ((y * size + x) * 4) as usize;
             let dx = x as f32 - center;
             let dy = y as f32 - center;
             let r  = (dx * dx + dy * dy).sqrt();
-
             if r > center { continue; }
 
-            // Navy background
-            rgba[i]   = 18;
-            rgba[i+1] = 52;
-            rgba[i+2] = 140;
-            rgba[i+3] = 255;
+            rgba[i] = 18; rgba[i+1] = 52; rgba[i+2] = 140; rgba[i+3] = 255;
 
-            // Yellow sine wave
             let phase  = (x as f32 / size as f32) * std::f32::consts::TAU * 2.5;
             let wave_y = center + phase.sin() * center * 0.35;
             if (y as f32 - wave_y).abs() < 1.6 {
-                rgba[i]   = 255;
-                rgba[i+1] = 210;
-                rgba[i+2] = 0;
+                rgba[i] = 255; rgba[i+1] = 210; rgba[i+2] = 0;
             }
-
-            // Light-blue border ring
             if (r - center + 1.5).abs() < 1.5 {
-                rgba[i]   = 140;
-                rgba[i+1] = 170;
-                rgba[i+2] = 255;
+                rgba[i] = 140; rgba[i+1] = 170; rgba[i+2] = 255;
             }
         }
     }

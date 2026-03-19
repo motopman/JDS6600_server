@@ -89,8 +89,6 @@ fn main() -> eframe::Result<()> {
             .expect("Backend thread failed");
     }
 
-    let tray_controller = tray::create();
-
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("JDS6600 Remote Server")
@@ -103,9 +101,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "JDS6600 Server",
         options,
-        Box::new(move |cc| Box::new(ui::ServerApp::new(
-            cc, ws_url, tray_controller, quick_tx, mobile_rx,
-        ))),
+        Box::new(move |cc| {
+            let tray_controller = tray::create(cc.egui_ctx.clone());
+            Box::new(ui::ServerApp::new(cc, ws_url, tray_controller, quick_tx, mobile_rx))
+        }),
     )
 }
 
