@@ -81,6 +81,17 @@ pub enum IncomingMessage {
 
     #[serde(rename = "control_command")]
     ControlCommand(ControlPayload),
+
+    /// One-shot device command (e.g. set triangle wave) sent from the UI.
+    /// Does not go through the Sequencer — routed directly to the Dispatcher.
+    #[serde(rename = "quick_command")]
+    QuickCommand(QuickCommandPayload),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QuickCommandPayload {
+    /// e.g. "set_waveform_triangle_ch1"
+    pub action: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,4 +152,39 @@ impl SharedSnapshot {
             error_message: self.error_message.clone(),
         }
     }
+}
+
+// ── Live device state (read from hardware on connect) ─────────────────────
+
+/// Current parameter values read directly from the JDS6600.
+/// Populated once after hardware connects and after each Quick Command.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LiveChannelState {
+    pub waveform:     Waveform,
+    pub frequency_hz: f64,
+    pub amplitude_v:  f64,
+    pub offset_v:     f64,
+    pub duty_percent: f64,
+}
+
+impl Default for Waveform {
+    fn default() -> Self { Waveform::Sine }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LiveDeviceState {
+    pub ch1: LiveChannelState,
+    pub ch2: LiveChannelState,
+}
+
+// ── Commands sent from the UI to the Watchdog ─────────────────────────────
+
+/// Signals sent from the UI thread (via a `watch` channel) to the Watchdog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchdogCmd {
+    /// Normal steady-state – watchdog manages port on its own schedule.
+    Idle,
+    /// UI scanner wants exclusive port access for its sweep.
+    /// Watchdog must release the port and notify when done.
+    ScannerActive,
 }

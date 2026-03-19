@@ -2,23 +2,31 @@ use axum::{
     extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State},
     response::Response,
 };
+use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::models::{ControlCommand, IncomingMessage, OutgoingMessage};
+use crate::dispatcher::DispatcherHandle;
+use crate::models::{
+    ControlCommand, IncomingMessage, LiveDeviceState, QuickCommandPayload, Waveform,
+};
+use crate::protocol::commands::GeneratorCommand;
 use crate::sequencer::SequencerEvent;
 use crate::server::ServerState;
+
+// ── Upgrade ───────────────────────────────────────────────────────────────
 
 pub async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<ServerState>) -> Response {
     ws.on_upgrade(move |socket| handle(socket, state))
 }
 
+// ── Per-connection handler ────────────────────────────────────────────────
+
 async fn handle(mut socket: WebSocket, state: ServerState) {
     tracing::info!("[WS] Client connected");
 
-    // Greet the client with the current server snapshot.
+    // Greet with current snapshot + live device state.
     if let Some(json) = greeting(&state).await {
         if socket.send(Message::Text(json)).await.is_err() {
-            tracing::warn!("[WS] Greeting failed – client gone immediately");
             return;
         }
     }
@@ -27,7 +35,6 @@ async fn handle(mut socket: WebSocket, state: ServerState) {
 
     loop {
         tokio::select! {
-            // ── Incoming from mobile ──────────────────────────────────
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => dispatch(&text, &state).await,
@@ -36,22 +43,17 @@ async fn handle(mut socket: WebSocket, state: ServerState) {
                         tracing::info!("[WS] Client disconnected");
                         break;
                     }
-                    Some(Ok(_))   => {} // binary frames ignored
+                    Some(Ok(_))   => {}
                     Some(Err(e))  => { tracing::warn!("[WS] Recv error: {}", e); break; }
                 }
             }
-
-            // ── Status push from sequencer ────────────────────────────
             result = status_rx.recv() => {
                 match result {
                     Ok(json) => {
-                        if socket.send(Message::Text(json)).await.is_err() {
-                            tracing::warn!("[WS] Send failed – client gone");
-                            break;
-                        }
+                        if socket.send(Message::Text(json)).await.is_err() { break; }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("[WS] Broadcast lagged by {} messages", n);
+                        tracing::warn!("[WS] Lagged by {} messages", n);
                     }
                     Err(_) => break,
                 }
@@ -60,13 +62,14 @@ async fn handle(mut socket: WebSocket, state: ServerState) {
     }
 }
 
+// ── Message routing ───────────────────────────────────────────────────────
+
 async fn dispatch(text: &str, state: &ServerState) {
     tracing::debug!("[WS] RX: {}", text);
     match serde_json::from_str::<IncomingMessage>(text) {
         Ok(IncomingMessage::SequenceUpload(seq)) => {
-            tracing::info!("[WS] SequenceUpload '{}' ({} blocks)",
-                seq.sequence_name, seq.blocks.len());
-            send(state, SequencerEvent::SequenceLoaded(seq)).await;
+            tracing::info!("[WS] SequenceUpload '{}' ({} blocks)", seq.sequence_name, seq.blocks.len());
+            seq_send(state, SequencerEvent::SequenceLoaded(seq)).await;
         }
         Ok(IncomingMessage::ControlCommand(ctrl)) => {
             tracing::info!("[WS] Control: {:?}", ctrl.command);
@@ -76,7 +79,11 @@ async fn dispatch(text: &str, state: &ServerState) {
                 ControlCommand::Pause  => SequencerEvent::Pause,
                 ControlCommand::Resume => SequencerEvent::Resume,
             };
-            send(state, ev).await;
+            seq_send(state, ev).await;
+        }
+        Ok(IncomingMessage::QuickCommand(qc)) => {
+            tracing::info!("[WS] QuickCommand: {}", qc.action);
+            handle_quick_command(qc, &state.dispatcher, &state.live_state).await;
         }
         Err(e) => {
             tracing::warn!("[WS] JSON parse error: {} — raw: {}", e, text);
@@ -84,13 +91,68 @@ async fn dispatch(text: &str, state: &ServerState) {
     }
 }
 
-async fn send(state: &ServerState, ev: SequencerEvent) {
+// ── Quick command executor ────────────────────────────────────────────────
+
+async fn handle_quick_command(
+    qc:         QuickCommandPayload,
+    dispatcher: &DispatcherHandle,
+    live_state: &tokio::sync::RwLock<LiveDeviceState>,
+) {
+    let cmd: Option<GeneratorCommand> = match qc.action.as_str() {
+        "set_waveform_sine_ch1"     => Some(GeneratorCommand::SetWaveform { channel: 1, waveform: Waveform::Sine }),
+        "set_waveform_square_ch1"   => Some(GeneratorCommand::SetWaveform { channel: 1, waveform: Waveform::Square }),
+        "set_waveform_triangle_ch1" => Some(GeneratorCommand::SetWaveform { channel: 1, waveform: Waveform::Triangle }),
+        "set_waveform_pulse_ch1"    => Some(GeneratorCommand::SetWaveform { channel: 1, waveform: Waveform::Pulse }),
+        "set_waveform_sine_ch2"     => Some(GeneratorCommand::SetWaveform { channel: 2, waveform: Waveform::Sine }),
+        "set_waveform_square_ch2"   => Some(GeneratorCommand::SetWaveform { channel: 2, waveform: Waveform::Square }),
+        "set_waveform_triangle_ch2" => Some(GeneratorCommand::SetWaveform { channel: 2, waveform: Waveform::Triangle }),
+        "set_waveform_pulse_ch2"    => Some(GeneratorCommand::SetWaveform { channel: 2, waveform: Waveform::Pulse }),
+        "output_on"  => Some(GeneratorCommand::SetOutputEnable { ch1: true,  ch2: true  }),
+        "output_off" => Some(GeneratorCommand::SetOutputEnable { ch1: false, ch2: false }),
+        other => {
+            tracing::warn!("[WS] Unknown quick command action: {}", other);
+            None
+        }
+    };
+
+    if let Some(cmd) = cmd {
+        // Update live state optimistically.
+        if let GeneratorCommand::SetWaveform { channel, ref waveform } = cmd {
+            let mut ls = live_state.write().await;
+            if channel == 1 { ls.ch1.waveform = waveform.clone(); }
+            else             { ls.ch2.waveform = waveform.clone(); }
+        }
+        if let Err(e) = dispatcher.send(cmd).await {
+            tracing::error!("[WS] Quick command dispatch failed: {}", e);
+        }
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+async fn seq_send(state: &ServerState, ev: SequencerEvent) {
     if let Err(e) = state.sequencer_tx.send(ev).await {
         tracing::error!("[WS] Sequencer channel closed: {}", e);
     }
 }
 
+/// Greeting includes both the sequencer snapshot and the live device state.
 async fn greeting(state: &ServerState) -> Option<String> {
-    let snap = state.snapshot.read().await;
-    serde_json::to_string(&OutgoingMessage::ServerStatus(snap.to_status_payload())).ok()
+    let snap  = state.snapshot.read().await;
+    let live  = state.live_state.read().await;
+
+    #[derive(Serialize)]
+    struct Greeting<'a> {
+        #[serde(rename = "type")]
+        kind:        &'static str,
+        payload:     &'a crate::models::StatusPayload,
+        live_device: &'a LiveDeviceState,
+    }
+
+    let payload = snap.to_status_payload();
+    serde_json::to_string(&Greeting {
+        kind:        "server_status",
+        payload:     &payload,
+        live_device: &live,
+    }).ok()
 }

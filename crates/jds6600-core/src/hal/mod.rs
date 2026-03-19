@@ -67,3 +67,5 @@ pub fn probe_jds6600(port_name: &str) -> bool {
         _ => false,
     }
 }
+
+pub mod reader;

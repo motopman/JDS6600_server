@@ -111,10 +111,11 @@ pub fn build_ascii_command(cmd: &GeneratorCommand) -> JdsResult<Vec<u8>> {
         }
 
         // ── Output enable ─────────────────────────────────────────────
-        // Format:  :w20=BITS.\r\n   (bit0=CH1, bit1=CH2)
+        // Format:  :w20=CH1,CH2.\r\n
+        //   :w20=1,1.  both on    :w20=0,0.  both off
+        //   :w20=1,0.  ch1 only   :w20=0,1.  ch2 only
         GeneratorCommand::SetOutputEnable { ch1, ch2 } => {
-            let bits: u8 = (*ch1 as u8) | ((*ch2 as u8) << 1);
-            format!(":w20={}.\r\n", bits)
+            format!(":w20={},{}.\r\n", *ch1 as u8, *ch2 as u8)
         }
     };
     Ok(frame.into_bytes())
@@ -282,11 +283,13 @@ mod tests {
     // ── Output enable ──────────────────────────────────────────────────
 
     #[test]
-    fn output_both_on()  { assert_eq!(s(&GeneratorCommand::SetOutputEnable { ch1: true,  ch2: true  }), ":w20=3.\r\n"); }
+    fn output_both_on()  { assert_eq!(s(&GeneratorCommand::SetOutputEnable { ch1: true,  ch2: true  }), ":w20=1,1.\r\n"); }
     #[test]
-    fn output_ch1_only() { assert_eq!(s(&GeneratorCommand::SetOutputEnable { ch1: true,  ch2: false }), ":w20=1.\r\n"); }
+    fn output_ch1_only() { assert_eq!(s(&GeneratorCommand::SetOutputEnable { ch1: true,  ch2: false }), ":w20=1,0.\r\n"); }
     #[test]
-    fn output_both_off() { assert_eq!(s(&GeneratorCommand::SetOutputEnable { ch1: false, ch2: false }), ":w20=0.\r\n"); }
+    fn output_ch2_only() { assert_eq!(s(&GeneratorCommand::SetOutputEnable { ch1: false, ch2: true  }), ":w20=0,1.\r\n"); }
+    #[test]
+    fn output_both_off() { assert_eq!(s(&GeneratorCommand::SetOutputEnable { ch1: false, ch2: false }), ":w20=0,0.\r\n"); }
 
     // ── Read command helper ────────────────────────────────────────────
 

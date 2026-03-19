@@ -1,14 +1,22 @@
-/// System tray icon management.
+/// System tray icon – create, poll events, update menu label dynamically.
 ///
-/// # Root cause of the original Show/Hide bug
-/// When `eframe` hides the window it stops scheduling repaints, so
-/// `App::update()` is never called, so `MenuEvent::receiver().try_recv()`
-/// never fires.  Fix: always call `ctx.request_repaint_after(50ms)` even
-/// in the hidden state so the egui event loop keeps ticking.
+/// ## Design
+/// `create()` returns a `TrayIcon` that must stay alive for the lifetime
+/// of the process.  We also store two things in thread-locals:
+///   • The two `MenuId`s for matching events.
+///   • The show/hide `MenuItem` itself, so we can call `set_text()` to
+///     show "Show Window" or "Hide Window" depending on current state.
 ///
-/// # Additional fix: close-to-tray
-/// The window X button now hides rather than exits.  We intercept the
-/// `close_requested` input flag, cancel it, then hide instead.
+/// ## Why `std::process::exit` for quit
+/// `egui::ViewportCommand::Close` is silently dropped by eframe when the
+/// window is in the hidden state (`Visible(false)`).  Calling exit(0)
+/// directly is the only reliable cross-platform quit path from a tray icon.
+///
+/// ## Keep-alive repaint
+/// When the window is hidden eframe stops scheduling repaints, so
+/// `update()` stops being called, so menu events are never polled.
+/// `poll()` always calls `ctx.request_repaint_after(50 ms)` to keep
+/// the loop alive regardless of window visibility.
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -19,49 +27,72 @@ use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
-// ── Thread-local storage for menu item IDs ────────────────────────────────
+// ── Thread-local storage ──────────────────────────────────────────────────
+
+struct TrayState {
+    show_id: MenuId,
+    quit_id: MenuId,
+    /// Kept so we can call `set_text()` on it dynamically.
+    show_item: MenuItem,
+}
 
 thread_local! {
-    static IDS: RefCell<Option<(MenuId, MenuId)>> = RefCell::new(None);
-}
-
-fn store(show: MenuId, quit: MenuId) {
-    IDS.with(|c| *c.borrow_mut() = Some((show, quit)));
-}
-
-fn ids() -> (MenuId, MenuId) {
-    IDS.with(|c| c.borrow().clone().expect("call tray::create() first"))
+    static TRAY: RefCell<Option<TrayState>> = RefCell::new(None);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-/// Create the tray icon.  Must be called from the main OS thread.
-/// Keep the returned value alive for the life of the process.
+/// Create the tray icon.  **Must be called from the main OS thread.**
+/// Store the returned `TrayIcon` in a binding that lives until process exit.
 pub fn create() -> TrayIcon {
     let icon = Icon::from_rgba(draw_icon(32), 32, 32)
         .expect("Tray icon pixel data invalid");
 
-    let menu = Menu::new();
-    let show = MenuItem::new("Show / Hide Window", true, None);
-    let quit = MenuItem::new("Quit",               true, None);
-    menu.append(&show).unwrap();
-    menu.append(&quit).unwrap();
-    store(show.id().clone(), quit.id().clone());
+    let menu      = Menu::new();
+    let show_item = MenuItem::new("Hide Window", true, None);  // window starts visible
+    let quit_item = MenuItem::new("Quit",        true, None);
+    menu.append(&show_item).unwrap();
+    menu.append(&quit_item).unwrap();
+
+    TRAY.with(|t| {
+        *t.borrow_mut() = Some(TrayState {
+            show_id:   show_item.id().clone(),
+            quit_id:   quit_item.id().clone(),
+            show_item,
+        });
+    });
 
     TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("JDS6600 Server – right-click for options")
+        .with_tooltip("JDS6600 Server")
         .with_icon(icon)
         .build()
         .expect("Failed to create tray icon")
 }
 
-/// Poll tray + menu events.  Call at the top of every `App::update()`.
-/// Mutates `visible`; also requests a repaint so the loop stays alive.
+/// Poll tray events every egui frame.
+///
+/// * Updates the menu label to "Hide Window" or "Show Window" based on
+///   the current `visible` state.
+/// * Toggles `visible` when the show/hide item is clicked or the icon
+///   is directly clicked.
+/// * Exits the process immediately on Quit.
+/// * Requests a 50 ms repaint to keep the loop alive when hidden.
 pub fn poll(ctx: &egui::Context, visible: &mut bool) {
-    let (show_id, quit_id) = ids();
+    // Update the menu label to always reflect what clicking will DO.
+    TRAY.with(|t| {
+        if let Some(ref state) = *t.borrow() {
+            let label = if *visible { "Hide Window" } else { "Show Window" };
+            state.show_item.set_text(label);
+        }
+    });
 
-    // Right-click context menu events
+    // Process menu events.
+    let (show_id, quit_id) = TRAY.with(|t| {
+        t.borrow().as_ref().map(|s| (s.show_id.clone(), s.quit_id.clone()))
+            .expect("call tray::create() first")
+    });
+
     while let Ok(ev) = MenuEvent::receiver().try_recv() {
         if ev.id == show_id {
             *visible = !*visible;
@@ -69,11 +100,13 @@ pub fn poll(ctx: &egui::Context, visible: &mut bool) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         } else if ev.id == quit_id {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            // ViewportCommand::Close is ignored when the window is hidden.
+            // std::process::exit(0) is the only reliable path.
+            std::process::exit(0);
         }
     }
 
-    // Direct icon click / double-click
+    // Direct click on the tray icon toggles visibility.
     while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
         if let TrayIconEvent::Click { .. } = ev {
             *visible = !*visible;
@@ -83,8 +116,7 @@ pub fn poll(ctx: &egui::Context, visible: &mut bool) {
         }
     }
 
-    // THE key fix: keep the event loop alive even when the window is hidden.
-    // Without this eframe stops calling update() and tray events are never polled.
+    // Keep the egui event loop alive even when the window is hidden.
     ctx.request_repaint_after(Duration::from_millis(50));
 }
 

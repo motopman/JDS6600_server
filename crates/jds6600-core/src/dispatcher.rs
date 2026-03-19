@@ -143,3 +143,37 @@ fn update_cache(cmd: &GeneratorCommand, state: &Arc<Mutex<DeviceState>>) {
         GeneratorCommand::SetOutputEnable{ ch1, ch2 }          => s.set_output(*ch1, *ch2),
     }
 }
+
+// ── Quick-command bridge (UI thread → async dispatcher) ───────────────────
+
+/// A `std::sync::mpsc` sender wrapper that lets the synchronous egui UI thread
+/// enqueue `GeneratorCommand`s into the async Dispatcher without blocking.
+///
+/// The backend spawns a tokio task that polls this queue each tick and forwards
+/// every pending command into the `DispatcherHandle`.
+#[derive(Clone)]
+pub struct QuickCmdSender {
+    tx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::SyncSender<GeneratorCommand>>>,
+}
+
+pub struct QuickCmdReceiver {
+    pub rx: std::sync::mpsc::Receiver<GeneratorCommand>,
+}
+
+/// Create a (sender, receiver) pair.  The sender is handed to the UI,
+/// the receiver is polled by a backend task.
+pub fn quick_cmd_channel() -> (QuickCmdSender, QuickCmdReceiver) {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<GeneratorCommand>(32);
+    (
+        QuickCmdSender { tx: std::sync::Arc::new(std::sync::Mutex::new(tx)) },
+        QuickCmdReceiver { rx },
+    )
+}
+
+impl QuickCmdSender {
+    /// Non-blocking enqueue from the UI thread.  Silently drops if the queue
+    /// is full (32 capacity is far more than any UI interaction can produce).
+    pub fn try_send(&self, cmd: GeneratorCommand) {
+        let _ = self.tx.lock().unwrap().try_send(cmd);
+    }
+}

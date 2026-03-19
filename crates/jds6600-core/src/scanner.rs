@@ -1,23 +1,27 @@
 /// Protocol Scanner – automatic port discovery + full sweep.
 ///
-/// ## What this answers
-/// "What does the physical device actually transmit in response to each command?"
+/// ## Watchdog coordination
+/// The scanner needs exclusive port access.  Before opening any port it
+/// signals the watchdog via a `tokio::sync::watch` channel by setting
+/// `WatchdogCmd::ScannerActive`.  The watchdog pauses its own polling.
+/// When the scan finishes (or on error) the channel is reset to `Idle`.
 ///
-/// ## Workflow
-/// 1. Enumerate every serial port on the OS.
-/// 2. Send the identification read `:r00=0.\r\n` to each port.
-/// 3. A valid JDS6600 reply starts with `:r00=`.
-/// 4. On confirmation, run the full read sweep r00..r120.
-/// 5. Then run targeted write probes to confirm OK-response format.
-/// 6. Results stream through `mpsc` so the UI can display live progress.
+/// ## PermissionDenied handling
+/// If `serialport::new(...).open()` returns `ErrorKind::PermissionDenied`
+/// (Windows: "Access is denied") we log it and skip – the port is already
+/// in use by something else.  We do NOT retry that port.
 ///
 /// ## Protocol correctness
-/// All read commands MUST use the form `:rXX=0.\r\n` (with `=0.` data field).
-/// A bare `:rXX.\r\n` (no `=`) is silently ignored by the JDS6600 firmware.
+/// Read frame: `:rXX=0.\r\n`  — the `=0.` data field is required by the
+/// JDS6600 firmware.  A bare `:rXX.\r\n` is silently discarded.
 
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use tokio::sync::watch;
+
+use crate::models::WatchdogCmd;
 
 // ── Public types ──────────────────────────────────────────────────────────
 
@@ -32,14 +36,7 @@ pub struct ScanLine {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LineKind {
-    Info,
-    Data,
-    Found,
-    Skip,
-    Done,
-    Error,
-}
+pub enum LineKind { Info, Data, Found, Skip, Done, Error }
 
 impl ScanLine {
     fn info(s: impl Into<String>)  -> Self { Self { kind: LineKind::Info,  message: s.into() } }
@@ -52,11 +49,12 @@ impl ScanLine {
 
 // ── Entry point ───────────────────────────────────────────────────────────
 
-pub fn start_scan() -> ScanHandle {
+/// Start a scan.  The watchdog `cmd_tx` is used to signal port ownership.
+pub fn start_scan(cmd_tx: watch::Sender<WatchdogCmd>) -> ScanHandle {
     let (tx, rx) = mpsc::channel();
     thread::Builder::new()
         .name("jds-scanner".into())
-        .spawn(move || run_scan(tx))
+        .spawn(move || run_scan(tx, cmd_tx))
         .expect("Failed to spawn scanner thread");
     ScanHandle { rx }
 }
@@ -64,185 +62,178 @@ pub fn start_scan() -> ScanHandle {
 // ── Constants ─────────────────────────────────────────────────────────────
 
 const BAUD:          u32 = 115_200;
-const PROBE_TIMEOUT: u64 = 600;  // ms – per-port identification (generous)
-const SWEEP_TIMEOUT: u64 = 500;  // ms – per-command during sweep
-const INTER_CMD_MS:  u64 = 50;   // ms – rate limit between commands (device buffer ~128 B)
+const PROBE_TIMEOUT: u64 = 600;
+const SWEEP_TIMEOUT: u64 = 500;
+const INTER_CMD_MS:  u64 = 50;
 
-fn tx_send(tx: &mpsc::Sender<ScanLine>, line: ScanLine) {
-    let _ = tx.send(line);
-}
+fn log(tx: &mpsc::Sender<ScanLine>, line: ScanLine) { let _ = tx.send(line); }
 
-// ── Main scan loop ────────────────────────────────────────────────────────
+// ── Main scan ─────────────────────────────────────────────────────────────
 
-fn run_scan(tx: mpsc::Sender<ScanLine>) {
+fn run_scan(tx: mpsc::Sender<ScanLine>, cmd_tx: watch::Sender<WatchdogCmd>) {
+    // Signal watchdog to pause its port access.
+    let _ = cmd_tx.send(WatchdogCmd::ScannerActive);
+    log(&tx, ScanLine::info("Scanner taking port ownership — watchdog paused."));
+
+    // Small delay so the watchdog's current probe (if any) can finish and
+    // release its port handle before we try to open.
+    thread::sleep(Duration::from_millis(300));
+
     let ports = match serialport::available_ports() {
         Ok(p) => p,
         Err(e) => {
-            tx_send(&tx, ScanLine::err(format!("Port enumeration failed: {}", e)));
-            tx_send(&tx, ScanLine::done("Scan aborted."));
+            log(&tx, ScanLine::err(format!("Port enumeration error: {}", e)));
+            let _ = cmd_tx.send(WatchdogCmd::Idle);
+            log(&tx, ScanLine::done("Scan aborted."));
             return;
         }
     };
 
     if ports.is_empty() {
-        tx_send(&tx, ScanLine::err("No serial ports found on this system."));
-        tx_send(&tx, ScanLine::err("→ Check USB cable and CH340/CP2102 driver."));
-        tx_send(&tx, ScanLine::done("Scan finished – no ports."));
+        log(&tx, ScanLine::err("No serial ports found on this system."));
+        log(&tx, ScanLine::err("→ Check USB cable and CH340/CP2102 driver."));
+        let _ = cmd_tx.send(WatchdogCmd::Idle);
+        log(&tx, ScanLine::done("Scan finished — no ports."));
         return;
     }
 
-    tx_send(&tx, ScanLine::info(format!(
-        "Found {} port(s) — probing each for JDS6600 (baud: 115200 8N1):", ports.len()
+    log(&tx, ScanLine::info(format!(
+        "Found {} port(s) — probing each for JDS6600 (115200 8N1):", ports.len()
     )));
     for p in &ports {
-        tx_send(&tx, ScanLine::info(format!("  • {}", p.port_name)));
+        log(&tx, ScanLine::info(format!("  • {}", p.port_name)));
     }
-    tx_send(&tx, ScanLine::info(
-        "Identification probe: :r00=0.  (correct JDS6600 read format)".to_string()
-    ));
+    log(&tx, ScanLine::info("Probe command: :r00=0.\\r\\n".to_string()));
 
     let mut found_any = false;
 
     for port_info in &ports {
         let port_name = &port_info.port_name;
-        tx_send(&tx, ScanLine::info(format!("─── {} ───────────────────────────", port_name)));
+        log(&tx, ScanLine::info(format!("─── {} ──────────────────────────", port_name)));
 
-        let mut port = match open_port(port_name, PROBE_TIMEOUT) {
-            Ok(p) => p,
+        match open_port(port_name, PROBE_TIMEOUT) {
             Err(e) => {
-                tx_send(&tx, ScanLine::skip(format!("  ✗ Cannot open: {}", e)));
+                let detail = if is_permission_denied(&e) {
+                    format!("  ✗ Access denied — port is busy (watchdog or another app)\n  \
+                             Hint: another process may hold {}. Try again.", port_name)
+                } else {
+                    format!("  ✗ Cannot open: {:?} — {}", e.kind(), e)
+                };
+                log(&tx, ScanLine::skip(detail));
                 continue;
             }
-        };
+            Ok(mut port) => {
+                match probe_cmd(port.as_mut(), ":r00=0.\r\n", PROBE_TIMEOUT) {
+                    Some((elapsed, _raw, ascii)) if !ascii.is_empty() => {
+                        log(&tx, ScanLine::found(format!(
+                            "  ✓ JDS6600 found! ({} ms)  →  {:?}", elapsed.as_millis(), ascii
+                        )));
+                        found_any = true;
+                        // Drop port cleanly before re-opening for sweep.
+                        drop(port);
+                        thread::sleep(Duration::from_millis(50));
 
-        // Identification: use correct `:r00=0.\r\n` format.
-        // A bare `:r00.\r\n` is ignored by the firmware.
-        match probe_cmd(port.as_mut(), ":r00=0.\r\n", PROBE_TIMEOUT) {
-            Some((elapsed, _raw_hex, ascii)) if ascii.starts_with(":r00=") || !ascii.is_empty() => {
-                tx_send(&tx, ScanLine::found(format!(
-                    "  ✓ JDS6600 detected!  ({} ms)  response: {:?}",
-                    elapsed.as_millis(), ascii
-                )));
-                found_any = true;
-                drop(port);
-
-                match open_port(port_name, SWEEP_TIMEOUT) {
-                    Ok(mut sweep_port) => {
-                        run_read_sweep(&tx, port_name, sweep_port.as_mut());
-                        run_write_probes(&tx, port_name, sweep_port.as_mut());
+                        match open_port(port_name, SWEEP_TIMEOUT) {
+                            Ok(mut sweep_port) => {
+                                run_read_sweep(&tx, port_name, sweep_port.as_mut());
+                                run_write_probes(&tx, port_name, sweep_port.as_mut());
+                            }
+                            Err(e) => {
+                                log(&tx, ScanLine::err(format!("  Re-open for sweep failed: {}", e)));
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tx_send(&tx, ScanLine::err(format!("  Re-open for sweep failed: {}", e)));
+                    Some((elapsed, raw, ascii)) => {
+                        log(&tx, ScanLine::skip(format!(
+                            "  ✗ No JDS6600 response ({} ms)  hex:[{}]  str:{:?}",
+                            elapsed.as_millis(),
+                            if raw.is_empty() { "—".into() } else { raw },
+                            ascii
+                        )));
+                    }
+                    None => {
+                        log(&tx, ScanLine::skip("  ✗ Timeout / IO error".to_string()));
                     }
                 }
-            }
-            Some((elapsed, raw_hex, ascii)) => {
-                tx_send(&tx, ScanLine::skip(format!(
-                    "  ✗ No JDS6600 response ({} ms)  hex: [{}]  ascii: {:?}",
-                    elapsed.as_millis(),
-                    if raw_hex.is_empty() { "—".into() } else { raw_hex },
-                    ascii
-                )));
-            }
-            None => {
-                tx_send(&tx, ScanLine::skip(format!("  ✗ Timeout / IO error")));
             }
         }
     }
 
     if !found_any {
-        tx_send(&tx, ScanLine::err("No JDS6600 found on any port."));
-        tx_send(&tx, ScanLine::err("→ Verify USB cable, power, and driver (CH340G or CP2102)."));
+        log(&tx, ScanLine::err("No JDS6600 found on any accessible port."));
+        log(&tx, ScanLine::err("→ Check USB cable, power, and CH340G/CP2102 driver."));
     }
 
-    tx_send(&tx, ScanLine::done("══════════ Scan complete ══════════".to_string()));
+    // Always release watchdog, even on error.
+    let _ = cmd_tx.send(WatchdogCmd::Idle);
+    log(&tx, ScanLine::info("Watchdog port access restored.".to_string()));
+    log(&tx, ScanLine::done("══════════ Scan complete ══════════".to_string()));
 }
 
-// ── Read sweep: r00..r120 ─────────────────────────────────────────────────
+// ── Sweep helpers ─────────────────────────────────────────────────────────
 
 fn run_read_sweep(
     tx: &mpsc::Sender<ScanLine>,
     port_name: &str,
     port: &mut dyn serialport::SerialPort,
 ) {
-    tx_send(tx, ScanLine::info(format!("  Read sweep r00..r120 on {}...", port_name)));
-    tx_send(tx, ScanLine::data(
-        "  CODE │ ms   │ HEX response                    │ ASCII response".to_string()
+    log(tx, ScanLine::info(format!("  Read sweep r00..r120 on {}...", port_name)));
+    log(tx, ScanLine::data(
+        "  CODE │ ms   │ HEX response                    │ ASCII".to_string()
     ));
-    tx_send(tx, ScanLine::data(
+    log(tx, ScanLine::data(
         "  ─────┼──────┼─────────────────────────────────┼────────────────────────".to_string()
     ));
 
     for code in 0u8..=120 {
-        // Correct read format: :rXX=0.\r\n
         let cmd = format!(":r{:02}=0.\r\n", code);
-
         match probe_cmd(port, &cmd, SWEEP_TIMEOUT) {
-            Some((elapsed, raw_hex, ascii)) => {
-                let empty_marker = if ascii.is_empty() { " ·" } else { "  " };
-                tx_send(tx, ScanLine::data(format!(
-                    "  {:>4} │ {:>4} │ {:<31} │ {}{}",
-                    code,
-                    elapsed.as_millis(),
-                    if raw_hex.is_empty() { "(no response)".into() } else { raw_hex },
-                    empty_marker,
+            Some((elapsed, raw, ascii)) => {
+                log(tx, ScanLine::data(format!(
+                    "  {:>4} │ {:>4} │ {:<31} │ {}",
+                    code, elapsed.as_millis(),
+                    if raw.is_empty() { "(no response)".into() } else { raw },
                     ascii
                 )));
             }
             None => {
-                tx_send(tx, ScanLine::data(format!("  {:>4} │  ERR │ (IO error)", code)));
+                log(tx, ScanLine::data(format!("  {:>4} │  ERR │ (IO error)", code)));
             }
         }
-
         thread::sleep(Duration::from_millis(INTER_CMD_MS));
     }
-
-    tx_send(tx, ScanLine::info(format!("  ✓ Read sweep complete on {}.", port_name)));
+    log(tx, ScanLine::info(format!("  ✓ Read sweep complete on {}.", port_name)));
 }
-
-// ── Write probes: characterise OK-response format ─────────────────────────
-// Sends a small set of known-safe writes using the CORRECT function codes
-// from the official JDS6600 manual.
 
 fn run_write_probes(
     tx: &mpsc::Sender<ScanLine>,
     port_name: &str,
     port: &mut dyn serialport::SerialPort,
 ) {
-    tx_send(tx, ScanLine::info(format!("  Write probes on {}...", port_name)));
-    tx_send(tx, ScanLine::info(
-        "  (Safe values: sine wave, 1 kHz, 1 Vpp, 0 V bias, outputs off)".to_string()
-    ));
-
-    // All commands use correct codes from the Joy-IT JDS6600 manual:
-    //   w21 = CH1 waveform,  w23 = CH1 frequency,  w25 = CH1 amplitude
-    //   w27 = CH1 bias (1000 = 0 V),               w20 = output enable
+    log(tx, ScanLine::info(format!("  Write probes on {}...", port_name)));
+    // Safe: sine wave, 1 kHz, 1 Vpp, 0 V bias, outputs off.
     let probes: &[(&str, &str)] = &[
-        (":w21=0.\r\n",        "CH1 waveform  = sine (w21=0)"),
-        (":w23=100000,0.\r\n", "CH1 frequency = 1000 Hz (w23=100000,0)"),
-        (":w25=1000.\r\n",     "CH1 amplitude = 1.0 Vpp (w25=1000 mV)"),
+        (":w21=0.\r\n",        "CH1 waveform  = sine    (w21=0)"),
+        (":w23=100000,0.\r\n", "CH1 frequency = 1000 Hz (w23)"),
+        (":w25=1000.\r\n",     "CH1 amplitude = 1.0 V   (w25, mV)"),
         (":w27=1000.\r\n",     "CH1 bias      = 0 V     (w27=1000)"),
         (":w20=0.\r\n",        "Outputs       = OFF     (w20=0)"),
     ];
-
-    for (cmd, description) in probes {
+    for (cmd, desc) in probes {
         match probe_cmd(port, cmd, SWEEP_TIMEOUT) {
-            Some((elapsed, raw_hex, ascii)) => {
-                tx_send(tx, ScanLine::data(format!(
-                    "  WRITE {:>4}ms │ {:<40} → hex: [{}]  str: {:?}",
-                    elapsed.as_millis(), description, raw_hex, ascii
+            Some((elapsed, raw, ascii)) => {
+                log(tx, ScanLine::data(format!(
+                    "  WRITE {:>4}ms │ {:<40} → [{}] {:?}",
+                    elapsed.as_millis(), desc, raw, ascii
                 )));
             }
             None => {
-                tx_send(tx, ScanLine::data(format!(
-                    "  WRITE  ERR  │ {:<40} → timeout", description
-                )));
+                log(tx, ScanLine::data(format!("  WRITE  ERR │ {} → timeout", desc)));
             }
         }
         thread::sleep(Duration::from_millis(INTER_CMD_MS));
     }
-
-    tx_send(tx, ScanLine::info(format!("  ✓ Write probes complete on {}.", port_name)));
+    log(tx, ScanLine::info(format!("  ✓ Write probes complete on {}.", port_name)));
 }
 
 // ── Low-level I/O ─────────────────────────────────────────────────────────
@@ -251,28 +242,37 @@ fn open_port(
     name: &str,
     timeout_ms: u64,
 ) -> Result<Box<dyn serialport::SerialPort>, serialport::Error> {
-    serialport::new(name, BAUD)
+    tracing::debug!("[SCANNER] Opening port {} ...", name);
+    let result = serialport::new(name, BAUD)
         .timeout(Duration::from_millis(timeout_ms))
         .data_bits(serialport::DataBits::Eight)
         .stop_bits(serialport::StopBits::One)
         .parity(serialport::Parity::None)
         .flow_control(serialport::FlowControl::None)
-        .open()
+        .open();
+
+    match &result {
+        Ok(_)  => tracing::debug!("[SCANNER] Opened {}", name),
+        Err(e) => tracing::debug!("[SCANNER] Failed to open {}: {:?} — {}", name, e.kind(), e),
+    }
+    result
 }
 
-/// Send `cmd`, read until `\n` or timeout.
-/// Returns `(elapsed, hex, ascii_trimmed)` or `None` on fatal I/O error.
+fn is_permission_denied(e: &serialport::Error) -> bool {
+    matches!(e.kind(), serialport::ErrorKind::Io(k)
+        if k == std::io::ErrorKind::PermissionDenied
+            || k == std::io::ErrorKind::WouldBlock)
+}
+
 fn probe_cmd(
     port: &mut dyn serialport::SerialPort,
     cmd: &str,
     timeout_ms: u64,
 ) -> Option<(Duration, String, String)> {
     let _ = port.clear(serialport::ClearBuffer::All);
-
     let t0 = Instant::now();
-    if port.write_all(cmd.as_bytes()).is_err() {
-        return None;
-    }
+
+    if port.write_all(cmd.as_bytes()).is_err() { return None; }
 
     let deadline = t0 + Duration::from_millis(timeout_ms);
     let mut response: Vec<u8> = Vec::new();
@@ -280,7 +280,6 @@ fn probe_cmd(
 
     loop {
         if Instant::now() >= deadline { break; }
-
         match port.read(&mut byte) {
             Ok(1) => {
                 response.push(byte[0]);
@@ -292,15 +291,9 @@ fn probe_cmd(
         }
     }
 
-    let elapsed = t0.elapsed();
-    let hex = response.iter()
-        .map(|b| format!("{:02X}", b))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let hex = response.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
     let ascii = String::from_utf8_lossy(&response)
         .trim_end_matches(['\r', '\n'])
-        .trim()
-        .to_string();
-
-    Some((elapsed, hex, ascii))
+        .trim().to_string();
+    Some((t0.elapsed(), hex, ascii))
 }
