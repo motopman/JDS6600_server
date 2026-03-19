@@ -3,8 +3,6 @@ name = "jds6600-app"
 version = "0.1.0"
 edition = "2021"
 description = "GUI wrapper with system tray and QR code window for the JDS6600 server"
-# NOTE: eframe / tray-icon require Rust >= 1.80 and Cargo edition2024 transitive deps.
-# Build with: rustup update stable && cargo build -p jds6600-app
 rust-version = "1.80"
 
 [[bin]]
@@ -25,7 +23,7 @@ tray-icon = "0.14"
 qrcode = "0.13"
 image  = "0.24"
 
-# Async runtime (re-used from core, but we need the builder here)
+# Async runtime
 tokio = { version = "1.36", features = ["full"] }
 
 # Logging
@@ -35,6 +33,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Network utility
 local-ip-address = "0.6"
 
+# Open files in the default OS application (for "Save log" feature)
+open = "5"
+
 [target.'cfg(windows)'.dependencies]
-# For SetThreadExecutionState (prevent sleep) on Windows
 winapi = { version = "0.3", features = ["winbase", "winnt", "minwindef"] }
