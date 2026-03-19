@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
 
+use jds6600_core::models::MobileEvent;
 use jds6600_core::{
     dispatcher::{quick_cmd_channel, spawn_dispatcher},
     hal::mock::MockTransport,
@@ -58,6 +59,8 @@ fn main() -> eframe::Result<()> {
     let (watchdog_cmd_tx, watchdog_cmd_rx) = watch::channel(WatchdogCmd::Idle);
     // Direct UI→dispatcher bridge (sync sender lives in egui thread).
     let (quick_tx, quick_rx)        = quick_cmd_channel();
+    // Mobile client events → UI bridge (bounded 128, never blocks backend).
+    let (mobile_tx, mobile_rx) = std::sync::mpsc::sync_channel::<MobileEvent>(128);
 
     // ── Background Tokio thread ───────────────────────────────────────────
     {
@@ -80,6 +83,7 @@ fn main() -> eframe::Result<()> {
                         seq_tx2, seq_rx,
                         watchdog_cmd_tx2, watchdog_cmd_rx,
                         quick_rx,
+                        mobile_tx,
                     ));
             })
             .expect("Backend thread failed");
@@ -100,7 +104,7 @@ fn main() -> eframe::Result<()> {
         "JDS6600 Server",
         options,
         Box::new(move |cc| Box::new(ui::ServerApp::new(
-            cc, ws_url, tray_controller, quick_tx,
+            cc, ws_url, tray_controller, quick_tx, mobile_rx,
         ))),
     )
 }
@@ -117,6 +121,7 @@ async fn async_main(
     watchdog_cmd_tx: watch::Sender<WatchdogCmd>,
     watchdog_cmd_rx: watch::Receiver<WatchdogCmd>,
     quick_rx:        jds6600_core::dispatcher::QuickCmdReceiver,
+    mobile_tx:       std::sync::mpsc::SyncSender<MobileEvent>,
 ) {
     let transport: Arc<Mutex<Box<dyn jds6600_core::hal::Transport>>> =
         Arc::new(Mutex::new(Box::new(MockTransport::new())));
@@ -150,8 +155,9 @@ async fn async_main(
         });
     }
 
-    let engine = SequencerEngine::new(
+    let engine = SequencerEngine::with_mobile_tx(
         seq_rx, dispatcher.clone(), Arc::clone(&snapshot), status_tx.clone(),
+        Some(mobile_tx.clone()),
     );
     tokio::spawn(engine.run());
 
@@ -172,6 +178,7 @@ async fn async_main(
         dispatcher,
         live_state,
         watchdog_cmd: watchdog_cmd_tx,
+        mobile_tx,
     }).await;
 }
 

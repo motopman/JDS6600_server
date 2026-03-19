@@ -31,7 +31,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 use crate::dispatcher::DispatcherHandle;
-use crate::models::{OutgoingMessage, Sequence, SequenceBlock, SharedSnapshot, StatusPayload};
+use crate::models::{MobileEvent, OutgoingMessage, Sequence, SequenceBlock, SharedSnapshot, StatusPayload};
 use crate::protocol::commands::GeneratorCommand;
 
 // ── Public types ──────────────────────────────────────────────────────────
@@ -129,6 +129,8 @@ pub struct SequencerEngine {
     dispatcher: DispatcherHandle,
     snapshot:   Arc<RwLock<SharedSnapshot>>,
     status_tx:  broadcast::Sender<String>,
+    /// Push execution events to the egui UI (optional — None in tests).
+    mobile_tx:  Option<std::sync::mpsc::SyncSender<MobileEvent>>,
 }
 
 impl SequencerEngine {
@@ -138,6 +140,16 @@ impl SequencerEngine {
         snapshot:   Arc<RwLock<SharedSnapshot>>,
         status_tx:  broadcast::Sender<String>,
     ) -> Self {
+        Self::with_mobile_tx(event_rx, dispatcher, snapshot, status_tx, None)
+    }
+
+    pub fn with_mobile_tx(
+        event_rx:   mpsc::Receiver<SequencerEvent>,
+        dispatcher: DispatcherHandle,
+        snapshot:   Arc<RwLock<SharedSnapshot>>,
+        status_tx:  broadcast::Sender<String>,
+        mobile_tx:  Option<std::sync::mpsc::SyncSender<MobileEvent>>,
+    ) -> Self {
         Self {
             state: SequencerState::Disconnected,
             ctx: Context::new(),
@@ -145,6 +157,14 @@ impl SequencerEngine {
             dispatcher,
             snapshot,
             status_tx,
+            mobile_tx,
+        }
+    }
+
+    /// Helper: send a MobileEvent to the UI (ignores errors if channel full or not connected).
+    fn notify(&self, ev: MobileEvent) {
+        if let Some(tx) = &self.mobile_tx {
+            let _ = tx.try_send(ev);
         }
     }
 
@@ -191,12 +211,24 @@ impl SequencerEngine {
 
             // ── IDLE ──────────────────────────────────────────────────
             (SequencerState::Idle, SequencerEvent::SequenceLoaded(seq)) => {
-                tracing::info!("[SEQUENCER] Sequence '{}' loaded ({} blocks)",
-                    seq.sequence_name, seq.blocks.len());
+                let total_ms: u64 = seq.blocks.iter().map(|b| b.duration_ms).sum();
+                let total_secs = total_ms / 1000;
+                tracing::info!("[SEQUENCER] Sequence '{}' loaded ({} blocks, {}s total) → auto-start",
+                    seq.sequence_name, seq.blocks.len(), total_secs);
+                self.notify(MobileEvent::SequenceReceived {
+                    name:                seq.sequence_name.clone(),
+                    blocks:              seq.blocks.len(),
+                    total_duration_secs: total_secs,
+                });
                 self.ctx.sequence = Some(seq);
                 self.ctx.pointer  = 0;
-                None
+                // Auto-start: begin executing immediately without waiting for Start.
+                match self.begin_execution().await {
+                    Ok(())  => Some(SequencerState::Running),
+                    Err(e)  => Some(SequencerState::Error(e)),
+                }
             }
+            // Still accept an explicit Start command (e.g. from UI) — no-op if already running.
             (SequencerState::Idle, SequencerEvent::Start) => {
                 match self.begin_execution().await {
                     Ok(())  => Some(SequencerState::Running),
@@ -219,7 +251,11 @@ impl SequencerEngine {
                         }
                     }
                 } else {
-                    tracing::info!("[SEQUENCER] Sequence finished → IDLE");
+                    let name = self.ctx.sequence.as_ref()
+                        .map(|s| s.sequence_name.clone())
+                        .unwrap_or_default();
+                    tracing::info!("[SEQUENCER] Sequence '{}' finished → IDLE", name);
+                    self.notify(MobileEvent::SequenceFinished { name });
                     self.disable_outputs().await;
                     self.ctx.pointer       = 0;
                     self.ctx.block_start   = None;
@@ -236,6 +272,7 @@ impl SequencerEngine {
             }
             (SequencerState::Running, SequencerEvent::Stop) => {
                 tracing::info!("[SEQUENCER] Stop");
+                self.notify(MobileEvent::SequenceStopped);
                 self.disable_outputs().await;
                 self.ctx.pointer           = 0;
                 self.ctx.block_start       = None;
@@ -320,9 +357,20 @@ impl SequencerEngine {
             .ok_or_else(|| "Execution pointer past end of sequence".to_string())?
             .clone();
 
-        tracing::info!("[SEQUENCER] → Block {} | {}Hz {} amp={} dur={}ms",
-            self.ctx.pointer, block.frequency, block.waveform,
+        let block_total = self.ctx.sequence.as_ref().map(|s| s.blocks.len()).unwrap_or(1);
+        tracing::info!("[SEQUENCER] → Block {}/{} | {}Hz {} amp={}V dur={}ms",
+            self.ctx.pointer + 1, block_total, block.frequency, block.waveform,
             block.amplitude, block.duration_ms);
+
+        self.notify(MobileEvent::BlockStarted {
+            block_index: self.ctx.pointer,
+            block_total,
+            channel:     block.channel,
+            frequency:   block.frequency,
+            waveform:    block.waveform.to_string(),
+            amplitude:   block.amplitude,
+            duration_ms: block.duration_ms,
+        });
 
         // Waveform first – avoids transient wrong-waveform output.
         let cmds: &[GeneratorCommand] = &[

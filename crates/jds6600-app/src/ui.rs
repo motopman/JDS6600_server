@@ -27,12 +27,11 @@ use std::time::SystemTime;
 use std::time::Duration;
 
 use eframe::egui::{self, ColorImage, FontId, RichText, TextureHandle, TextureOptions};
-use image::Luma;
 use qrcode::QrCode;
 
 use jds6600_core::{
     dispatcher::QuickCmdSender,
-    models::Waveform,
+    models::{MobileEvent, Waveform},
     protocol::commands::GeneratorCommand,
 };
 
@@ -88,8 +87,14 @@ pub struct ServerApp {
     sent: [ChannelSent; 2],     // index 0 = CH1, index 1 = CH2
     output: [Option<bool>; 2],  // per-channel; index 0 = CH1, index 1 = CH2
 
+    // Mobile client state
+    mobile_rx:      std::sync::mpsc::Receiver<MobileEvent>,
+    client_count:   u32,
+    mobile_log:     Vec<String>,   // events from mobile
     // Command log
     log: Vec<String>,
+    /// Tracks the previous visibility so we only send Focus/label on transitions.
+    prev_visible: bool,
 }
 
 impl ServerApp {
@@ -98,6 +103,7 @@ impl ServerApp {
         ws_url:   String,
         tray:     TrayController,
         quick_tx: QuickCmdSender,
+        mobile_rx: std::sync::mpsc::Receiver<MobileEvent>,
     ) -> Self {
         Self {
             ws_url,
@@ -108,7 +114,11 @@ impl ServerApp {
             selected_channel: 1,
             sent:             [ChannelSent::default(), ChannelSent::default()],
             output:           [None, None],
+            mobile_rx,
+            client_count:     0,
+            mobile_log:       Vec::new(),
             log:              Vec::new(),
+            prev_visible:     true,
         }
     }
 
@@ -156,59 +166,154 @@ impl ServerApp {
             if on { "▶ ON" } else { "■ OFF" });
         self.send(&cmds, desc);
     }
+
+    /// Drain all pending mobile events and update client_count / mobile_log.
+    fn drain_mobile(&mut self) {
+        while let Ok(ev) = self.mobile_rx.try_recv() {
+            let ts = utc_time();
+            match ev {
+                MobileEvent::ClientConnected => {
+                    self.client_count = self.client_count.saturating_add(1);
+                    self.mobile_log.push(format!("{ts}  📱 Mobile client connected  (active: {})", self.client_count));
+                }
+                MobileEvent::ClientDisconnected => {
+                    self.client_count = self.client_count.saturating_sub(1);
+                    self.mobile_log.push(format!("{ts}  📴 Mobile client disconnected  (active: {})", self.client_count));
+                }
+                MobileEvent::SequenceReceived { name, blocks, total_duration_secs } => {
+                    let h = total_duration_secs / 3600;
+                    let m = (total_duration_secs % 3600) / 60;
+                    let s = total_duration_secs % 60;
+                    let dur = if h > 0 { format!("{}h {:02}m {:02}s", h, m, s) }
+                              else if m > 0 { format!("{}m {:02}s", m, s) }
+                              else { format!("{}s", s) };
+                    self.mobile_log.push(format!("{ts}  📥 Sequence [{name}]  {blocks} blocks  total: {dur}  ▶ starting"));
+                    self.log.push(format!("{ts}  ▶▶ SEQUENCE START: [{name}]  ({blocks} blocks, {dur})"));
+                }
+                MobileEvent::BlockStarted { block_index, block_total, channel, frequency, waveform, amplitude, duration_ms } => {
+                    let freq_label = if frequency >= 1_000_000.0 {
+                        format!("{:.3} MHz", frequency / 1_000_000.0)
+                    } else {
+                        format!("{:.3} kHz", frequency / 1_000.0)
+                    };
+                    let dur_s = duration_ms / 1000;
+
+                    // ── Update mobile progress log ─────────────────────────
+                    self.mobile_log.push(format!(
+                        "{ts}  ⚡ Block {}/{} — CH{} {} {} {:.1}V  ({}s)",
+                        block_index + 1, block_total, channel,
+                        freq_label, waveform, amplitude, dur_s
+                    ));
+
+                    // ── Mirror into the Sent Commands log ──────────────────
+                    // Each entry matches exactly what a manual button press
+                    // would produce, so the bottom panel shows the full picture.
+                    let ch_idx = (channel as usize).saturating_sub(1).min(1);
+
+                    // Parse waveform string back to enum for button highlight
+                    let wf = match waveform.to_uppercase().as_str() {
+                        "SINE"     => Some(jds6600_core::models::Waveform::Sine),
+                        "SQUARE"   => Some(jds6600_core::models::Waveform::Square),
+                        "TRIANGLE" => Some(jds6600_core::models::Waveform::Triangle),
+                        "PULSE"    => Some(jds6600_core::models::Waveform::Pulse),
+                        _          => None,
+                    };
+
+                    // Update button highlight state so the UI reflects
+                    // what the sequencer is actively playing.
+                    self.selected_channel = channel;
+                    if let Some(ref w) = wf {
+                        self.sent[ch_idx].waveform = Some(w.clone());
+                    }
+                    self.sent[ch_idx].frequency  = Some(frequency);
+                    self.output[ch_idx]          = Some(true);
+
+                    // Sent Commands log entries (same format as manual buttons)
+                    if let Some(ref w) = wf {
+                        self.log.push(format!("{ts}  [SEQ {}/{}] CH{}  {}  {:.1} V",
+                            block_index + 1, block_total, channel,
+                            wf_label(w), amplitude));
+                    }
+                    self.log.push(format!("{ts}  [SEQ {}/{}] CH{}  {}",
+                        block_index + 1, block_total, channel, freq_label));
+                    self.log.push(format!("{ts}  [SEQ {}/{}] CH{}  ▶ ON  ({}s)",
+                        block_index + 1, block_total, channel, dur_s));
+
+                    if self.log.len() > 500 { self.log.remove(0); }
+                }
+                MobileEvent::SequenceFinished { name } => {
+                    self.mobile_log.push(format!("{ts}  ✅ Sequence [{name}] complete"));
+                    self.log.push(format!("{ts}  ■■ SEQUENCE DONE: [{name}]"));
+                    // Clear output highlights — generator outputs disabled
+                    self.output = [Some(false), Some(false)];
+                }
+                MobileEvent::SequenceStopped => {
+                    self.mobile_log.push(format!("{ts}  ⏹ Sequence stopped"));
+                    self.log.push(format!("{ts}  ■■ SEQUENCE STOPPED"));
+                    self.output = [Some(false), Some(false)];
+                }
+                MobileEvent::ControlReceived { command } => {
+                    self.mobile_log.push(format!("{ts}  🎮 Control: {command}"));
+                }
+            }
+            // Cap log at 300 lines.
+            if self.mobile_log.len() > 300 {
+                self.mobile_log.remove(0);
+            }
+        }
+    }
 }
 
 // ── App trait ─────────────────────────────────────────────────────────────
 
 impl eframe::App for ServerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ── 1. Drain tray events ──────────────────────────────────────────
-        // The tray thread delivers events over a crossbeam channel.
-        // We process ALL pending events before doing anything else.
-        // update() NEVER returns early — viewport commands must be issued
-        // every frame regardless of visibility.
-        for ev in self.tray.drain() {
+        // ── 1. Drain mobile events ───────────────────────────────────────
+        self.drain_mobile();
+
+        // ── 2. Tray events ────────────────────────────────────────────────
+        while let Some(ev) = self.tray.try_recv() {
             match ev {
-                TrayEvent::Toggle => {
-                    self.visible = !self.visible;
-                }
-                TrayEvent::Quit => {
-                    std::process::exit(0);
-                }
+                TrayEvent::Toggle => { self.visible = !self.visible; }
+                TrayEvent::Quit   => { std::process::exit(0); }
             }
         }
 
-        // ── 2. Intercept window ✕ button — hide, do not quit ─────────────
+        // ── 3. Window ✕ → hide to tray ───────────────────────────────────
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.visible = false;
         }
 
-        // ── 3. Apply visibility and focus every frame ─────────────────────
-        // Always issue these commands — eframe drops them when redundant.
+        // ── 4. Sync viewport visibility ───────────────────────────────────
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.visible));
-        if self.visible {
-            // Focus is safe to issue every frame; eframe only acts on changes.
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+
+        // ── 5. Update tray label on state change ──────────────────────────
+        if self.visible != self.prev_visible {
+            self.tray.update_label(self.visible);
+            self.prev_visible = self.visible;
         }
 
-        // ── 4. Update tray menu label ─────────────────────────────────────
-        self.tray.update_label(self.visible);
-
-        // ── 5. Render (only when visible, but update() does NOT return) ───
-        if self.visible {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        render_header(ui, ctx, self);
-                        sep(ui);
-                        render_controls(ui, self);
-                        sep(ui);
-                        render_log(ui, self);
-                    });
-            });
+        // ── 6. When hidden: keep the event loop alive, skip rendering ─────
+        if !self.visible {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            return;
         }
+
+        // ── 7. Render ─────────────────────────────────────────────────────
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    render_header(ui, ctx, self);
+                    sep(ui);
+                    render_mobile_status(ui, self);
+                    sep(ui);
+                    render_controls(ui, self);
+                    sep(ui);
+                    render_log(ui, self);
+                });
+        });
     }
 }
 
@@ -227,11 +332,7 @@ fn render_header(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut ServerApp) {
         ui.add(egui::Image::new((tex.id(), egui::vec2(200.0, 200.0))));
         ui.add_space(6.0);
 
-        let mut url = app.ws_url.clone();
-        ui.add(egui::TextEdit::singleline(&mut url)
-            .font(egui::TextStyle::Monospace)
-            .desired_width(310.0)
-            .interactive(false));
+        ui.monospace(&app.ws_url);
         ui.add_space(8.0);
 
         ui.label(RichText::new("● Server running")
@@ -240,6 +341,48 @@ fn render_header(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut ServerApp) {
         if ui.button("  Minimize to Tray  ").clicked() { app.visible = false; }
         ui.add_space(4.0);
     });
+}
+
+
+// ── Mobile connection status + event log ──────────────────────────────────
+
+fn render_mobile_status(ui: &mut egui::Ui, app: &ServerApp) {
+    // ── Connection badge ──────────────────────────────────────────────────
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        let (dot, color, label) = if app.client_count > 0 {
+            ("●", egui::Color32::from_rgb(55, 210, 55),
+             format!("  {} mobile client{} connected",
+                app.client_count,
+                if app.client_count == 1 { "" } else { "s" }))
+        } else {
+            ("○", egui::Color32::GRAY, "  No mobile clients".to_string())
+        };
+        ui.label(RichText::new(dot).color(color).size(14.0).strong());
+        ui.label(RichText::new(label).size(13.0));
+    });
+
+    if app.mobile_log.is_empty() { return; }
+
+    ui.add_space(4.0);
+
+    // ── Event log (last events from mobile) ───────────────────────────────
+    egui::ScrollArea::vertical()
+        .id_source("mobile_log")
+        .max_height(100.0)
+        .auto_shrink([false, false])
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            ui.add_space(2.0);
+            for line in &app.mobile_log {
+                ui.label(
+                    RichText::new(line.as_str())
+                        .font(FontId::monospace(11.0))
+                        .color(egui::Color32::from_rgb(180, 220, 180)),
+                );
+            }
+            ui.add_space(2.0);
+        });
 }
 
 // ── Section 2: Controls ────────────────────────────────────────────────────

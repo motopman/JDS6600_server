@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
 
 use crate::dispatcher::DispatcherHandle;
-use crate::models::{LiveDeviceState, SharedSnapshot, WatchdogCmd};
+use crate::models::{LiveDeviceState, MobileEvent, SharedSnapshot, WatchdogCmd};
 use crate::sequencer::SequencerEvent;
 
 #[derive(Clone)]
@@ -18,6 +18,9 @@ pub struct ServerState {
     pub live_state:   Arc<RwLock<LiveDeviceState>>,
     /// Send `ScannerActive` / `Idle` to coordinate port ownership.
     pub watchdog_cmd: watch::Sender<WatchdogCmd>,
+    /// Push connection/message events to the egui UI.
+    /// `SyncSender` is `Clone + Send` — safe to store and clone in ws_handler.
+    pub mobile_tx: std::sync::mpsc::SyncSender<MobileEvent>,
 }
 
 pub async fn start_server(port: u16, state: ServerState) {

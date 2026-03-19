@@ -83,14 +83,10 @@ pub struct TrayController {
 }
 
 impl TrayController {
-    /// Drain all pending tray events.  Call at the top of every `update()`.
-    /// Never blocks.
-    pub fn drain(&self) -> Vec<TrayEvent> {
-        let mut out = Vec::new();
-        while let Ok(ev) = self.rx.try_recv() {
-            out.push(ev);
-        }
-        out
+    /// Non-blocking: return one pending event, or `None` if none.
+    /// Call in a loop at the top of `update()` — zero heap allocation.
+    pub fn try_recv(&self) -> Option<TrayEvent> {
+        self.rx.try_recv().ok()
     }
 
     /// Update the context-menu label to reflect what clicking WILL do.
@@ -154,19 +150,17 @@ fn spawn_event_thread(
                 match MenuEvent::receiver().recv() {
                     Ok(ev) => {
                         if ev.id == show_id {
-                            // Ignore send error: egui side may have exited.
                             let _ = tx.send(TrayEvent::Toggle);
                         } else if ev.id == quit_id {
-                            // Belt-and-suspenders: send the event so update()
-                            // can also react, then exit unconditionally so
-                            // Quit works even if the egui loop is suspended.
+                            // Single shutdown path: event goes to update(),
+                            // which calls exit(0).  If egui is sleeping,
+                            // the send succeeds and egui wakes on next frame.
                             let _ = tx.send(TrayEvent::Quit);
-                            std::process::exit(0);
                         }
                     }
                     Err(_) => {
-                        // Channel closed (process shutting down) — exit cleanly.
-                        std::process::exit(0);
+                        // MenuEvent channel closed — process is shutting down.
+                        break;
                     }
                 }
             }
