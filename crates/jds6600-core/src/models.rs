@@ -326,6 +326,14 @@ pub enum MobileEvent {
     SequenceReceived { name: String, blocks: usize, total_duration_secs: u64 },
     /// The client sent a control command (start/stop/pause/resume).
     ControlReceived { command: String },
+    /// Raw response line received from the JDS6600 after a write command.
+    DeviceResponse { sent: String, reply: String },
+    /// Hardware connection status changed — shown prominently in the UI header.
+    HardwareStatus {
+        connected: bool,
+        /// e.g. "COM4" when connected, reason when lost
+        detail: String,
+    },
     /// Sequencer started executing a block.
     BlockStarted {
         block_index: usize,

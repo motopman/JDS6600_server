@@ -46,8 +46,8 @@ impl Transport for MockTransport {
     fn read_line(&mut self, timeout_ms: u64) -> JdsResult<Option<String>> {
         if !self.connected { return Err(JdsError::HardwareNotConnected); }
         thread::sleep(self.latency.min(Duration::from_millis(timeout_ms)));
-        tracing::debug!("[MOCK RX] OK");
-        Ok(Some("OK\r\n".into()))
+        tracing::debug!("[MOCK RX] :ok");
+        Ok(Some(":ok\r\n".into()))
     }
 
     fn is_connected(&self) -> bool { self.connected }

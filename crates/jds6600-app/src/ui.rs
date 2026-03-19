@@ -23,7 +23,6 @@
 //! channel matches that value.  Channel and Output buttons reflect global
 //! state.  State is never read from hardware – only what WE sent is tracked.
 
-use std::time::SystemTime;
 use std::time::Duration;
 
 use eframe::egui::{self, ColorImage, FontId, RichText, TextureHandle, TextureOptions};
@@ -91,6 +90,9 @@ pub struct ServerApp {
     mobile_rx:      std::sync::mpsc::Receiver<MobileEvent>,
     client_count:   u32,
     mobile_log:     Vec<String>,   // events from mobile
+    // Hardware connection status (driven by watchdog)
+    hw_connected:   bool,
+    hw_detail:      String,        // "COM4" or "scanning 3 ports…"
     // Command log
     log: Vec<String>,
     /// Tracks the previous visibility so we only send Focus/label on transitions.
@@ -117,6 +119,8 @@ impl ServerApp {
             mobile_rx,
             client_count:     0,
             mobile_log:       Vec::new(),
+            hw_connected:     false,
+            hw_detail:        "searching for generator…".into(),
             log:              Vec::new(),
             prev_visible:     true,
         }
@@ -132,7 +136,7 @@ impl ServerApp {
         for cmd in cmds {
             self.quick_tx.try_send(cmd.clone());
         }
-        let ts = utc_time();
+        let ts = local_time();
         self.log.push(format!("{ts}  {}", description.into()));
     }
 
@@ -170,7 +174,7 @@ impl ServerApp {
     /// Drain all pending mobile events and update client_count / mobile_log.
     fn drain_mobile(&mut self) {
         while let Ok(ev) = self.mobile_rx.try_recv() {
-            let ts = utc_time();
+            let ts = local_time();
             match ev {
                 MobileEvent::ClientConnected => {
                     self.client_count = self.client_count.saturating_add(1);
@@ -255,6 +259,25 @@ impl ServerApp {
                 MobileEvent::ControlReceived { command } => {
                     self.mobile_log.push(format!("{ts}  🎮 Control: {command}"));
                 }
+                MobileEvent::HardwareStatus { connected, detail } => {
+                    self.hw_connected = connected;
+                    self.hw_detail    = detail.clone();
+                    if connected {
+                        self.mobile_log.push(format!("{ts}  ✅ Generator connected on {detail}"));
+                    } else if detail.contains("lost") {
+                        // Loss is alarming — write to both logs
+                        self.mobile_log.push(format!("{ts}  ⚠️  Generator LOST: {detail}"));
+                        self.log.push(format!("{ts}  ⚠️  GENERATOR DISCONNECTED — commands halted"));
+                    }
+                    // "scanning…" messages are silent — no log entry
+                }
+                MobileEvent::DeviceResponse { sent, reply } => {
+                    // Show in the Sent Commands log alongside the outgoing command.
+                    // Format:  TX: :w21=0.    RX: :ok
+                    self.log.push(format!("{ts}  TX: {sent}"));
+                    self.log.push(format!("{ts}  RX: {reply}"));
+                    if self.log.len() > 500 { self.log.drain(0..50); }
+                }
             }
             // Cap log at 300 lines.
             if self.mobile_log.len() > 300 {
@@ -335,8 +358,18 @@ fn render_header(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut ServerApp) {
         ui.monospace(&app.ws_url);
         ui.add_space(8.0);
 
-        ui.label(RichText::new("● Server running")
-            .color(egui::Color32::from_rgb(55, 210, 55)).strong());
+        // ── Hardware connection status ────────────────────────────────────
+        let (dot, color, hw_msg) = if app.hw_connected {
+            ("●", egui::Color32::from_rgb(55, 210, 55),
+             format!("Generator connected — {}", app.hw_detail))
+        } else if app.hw_detail.contains("lost") {
+            ("✗", egui::Color32::from_rgb(220, 60, 60),
+             format!("Generator DISCONNECTED — {}", app.hw_detail))
+        } else {
+            ("◌", egui::Color32::from_rgb(220, 160, 30),
+             format!("Searching… {}", app.hw_detail))
+        };
+        ui.label(RichText::new(format!("{dot}  {hw_msg}")).strong().color(color));
         ui.add_space(6.0);
         if ui.button("  Minimize to Tray  ").clicked() { app.visible = false; }
         ui.add_space(4.0);
@@ -565,15 +598,9 @@ fn wf_label(wf: &Waveform) -> &'static str {
 }
 
 /// Current UTC wall-clock time as HH:MM:SS.
-fn utc_time() -> String {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
-    let h = (secs % 86_400) / 3_600;
-    let m = (secs % 3_600)  / 60;
-    let s =  secs % 60;
-    format!("{h:02}:{m:02}:{s:02}")
+fn local_time() -> String {
+    let now = chrono::Local::now();
+    now.format("%H:%M:%S").to_string()
 }
 
 // ── QR code ────────────────────────────────────────────────────────────────

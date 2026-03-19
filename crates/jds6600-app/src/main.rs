@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, mpsc, watch, RwLock};
 
 use jds6600_core::models::MobileEvent;
 use jds6600_core::{
-    dispatcher::{quick_cmd_channel, spawn_dispatcher},
+    dispatcher::{quick_cmd_channel, spawn_dispatcher_with_log},
     hal::mock::MockTransport,
     models::{LiveDeviceState, SharedSnapshot, WatchdogCmd},
     protocol::device_state::DeviceState,
@@ -128,13 +128,14 @@ async fn async_main(
     let device_state = Arc::new(Mutex::new(DeviceState::new()));
 
     let seq_tx_err = seq_tx.clone();
-    let dispatcher = spawn_dispatcher(
+    let dispatcher = spawn_dispatcher_with_log(
         Arc::clone(&transport),
         Arc::clone(&device_state),
         move || {
             let tx = seq_tx_err.clone();
             tokio::spawn(async move { let _ = tx.send(SequencerEvent::HardwareLost).await; });
         },
+        Some(mobile_tx.clone()),
     );
 
     // Bridge: poll the std::sync::mpsc receiver and forward to the async dispatcher.
@@ -167,6 +168,7 @@ async fn async_main(
         seq_tx.clone(),
         watchdog_cmd_rx,
         Arc::clone(&live_state),
+        Some(mobile_tx.clone()),
     ));
 
     sleep_inhibit::enable();

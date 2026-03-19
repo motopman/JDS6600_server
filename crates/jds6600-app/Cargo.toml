@@ -34,6 +34,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Network utility
 local-ip-address = "0.6"
 
+# Local time (for log timestamps)
+chrono = { version = "0.4", features = ["clock"] }
+
 # Open files in the default OS application (for "Save log" feature)
 open = "5"
 

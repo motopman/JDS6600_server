@@ -211,21 +211,25 @@ impl SequencerEngine {
 
             // ── IDLE ──────────────────────────────────────────────────
             (SequencerState::Idle, SequencerEvent::SequenceLoaded(seq)) => {
-                let total_ms: u64 = seq.blocks.iter().map(|b| b.duration_ms).sum();
-                let total_secs = total_ms / 1000;
-                tracing::info!("[SEQUENCER] Sequence '{}' loaded ({} blocks, {}s total) → auto-start",
-                    seq.sequence_name, seq.blocks.len(), total_secs);
-                self.notify(MobileEvent::SequenceReceived {
-                    name:                seq.sequence_name.clone(),
-                    blocks:              seq.blocks.len(),
-                    total_duration_secs: total_secs,
-                });
-                self.ctx.sequence = Some(seq);
-                self.ctx.pointer  = 0;
-                // Auto-start: begin executing immediately without waiting for Start.
-                match self.begin_execution().await {
-                    Ok(())  => Some(SequencerState::Running),
-                    Err(e)  => Some(SequencerState::Error(e)),
+                if seq.blocks.is_empty() {
+                    tracing::warn!("[SEQUENCER] Received empty sequence — ignoring");
+                    None
+                } else {
+                    let total_ms: u64 = seq.blocks.iter().map(|b| b.duration_ms).sum();
+                    let total_secs = total_ms / 1000;
+                    tracing::info!("[SEQUENCER] Sequence '{}' loaded ({} blocks, {}s total) → auto-start",
+                        seq.sequence_name, seq.blocks.len(), total_secs);
+                    self.notify(MobileEvent::SequenceReceived {
+                        name:                seq.sequence_name.clone(),
+                        blocks:              seq.blocks.len(),
+                        total_duration_secs: total_secs,
+                    });
+                    self.ctx.sequence = Some(seq);
+                    self.ctx.pointer  = 0;
+                    match self.begin_execution().await {
+                        Ok(())  => Some(SequencerState::Running),
+                        Err(e)  => Some(SequencerState::Error(e)),
+                    }
                 }
             }
             // Still accept an explicit Start command (e.g. from UI) — no-op if already running.
@@ -262,6 +266,61 @@ impl SequencerEngine {
                     Some(SequencerState::Idle)
                 }
             }
+            // ── New sequence while RUNNING — stop + restart atomically ─────────
+            // Client guarantee: they send stop before upload, but the server
+            // must also handle the case where the previous sequence is still
+            // running when a new upload arrives.  We stop cleanly first.
+            (SequencerState::Running, SequencerEvent::SequenceLoaded(seq)) => {
+                if seq.blocks.is_empty() {
+                    tracing::warn!("[SEQUENCER] Received empty sequence while RUNNING — ignoring");
+                    None
+                } else {
+                    let total_ms: u64 = seq.blocks.iter().map(|b| b.duration_ms).sum();
+                    let total_secs = total_ms / 1000;
+                    tracing::info!("[SEQUENCER] New sequence while RUNNING → stop + restart: '{}' ({} blocks)",
+                        seq.sequence_name, seq.blocks.len());
+                    self.notify(MobileEvent::SequenceStopped);   // close previous
+                    self.disable_outputs().await;
+                    self.notify(MobileEvent::SequenceReceived {
+                        name:                seq.sequence_name.clone(),
+                        blocks:              seq.blocks.len(),
+                        total_duration_secs: total_secs,
+                    });
+                    self.ctx = Context::new();
+                    self.ctx.sequence = Some(seq);
+                    match self.begin_execution().await {
+                        Ok(())  => Some(SequencerState::Running),
+                        Err(e)  => Some(SequencerState::Error(e)),
+                    }
+                }
+            }
+
+            // ── New sequence while PAUSED — same treatment ────────────────
+            (SequencerState::Paused, SequencerEvent::SequenceLoaded(seq)) => {
+                if seq.blocks.is_empty() {
+                    tracing::warn!("[SEQUENCER] Received empty sequence while PAUSED — ignoring");
+                    None
+                } else {
+                    let total_ms: u64 = seq.blocks.iter().map(|b| b.duration_ms).sum();
+                    let total_secs = total_ms / 1000;
+                    tracing::info!("[SEQUENCER] New sequence while PAUSED → stop + restart: '{}'",
+                        seq.sequence_name);
+                    self.notify(MobileEvent::SequenceStopped);
+                    self.disable_outputs().await;
+                    self.notify(MobileEvent::SequenceReceived {
+                        name:                seq.sequence_name.clone(),
+                        blocks:              seq.blocks.len(),
+                        total_duration_secs: total_secs,
+                    });
+                    self.ctx = Context::new();
+                    self.ctx.sequence = Some(seq);
+                    match self.begin_execution().await {
+                        Ok(())  => Some(SequencerState::Running),
+                        Err(e)  => Some(SequencerState::Error(e)),
+                    }
+                }
+            }
+
             (SequencerState::Running, SequencerEvent::Pause) => {
                 let rem = self.ctx.time_remaining();
                 self.ctx.paused_remaining = Some(rem);

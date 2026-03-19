@@ -1,22 +1,23 @@
-/// Hardware watchdog – lifecycle owner for the serial transport.
+/// Hardware watchdog — scans for and monitors the JDS6600.
 ///
-/// ## Startup
-/// 1. Scans all ports immediately; on JDS6600 found → reads current state
-///    → publishes to `live_state` → sends `HardwareFound`.
-/// 2. If no device after `MOCK_FALLBACK_SECS` → sends `HardwareFound` in
-///    mock mode (UI still transitions out of DISCONNECTED).
+/// ## Design
 ///
-/// ## Port coordination with the UI scanner
-/// The UI scanner (triggered by the "Scan All Ports" button) needs to open
-/// the same port the watchdog is monitoring.  On Windows, two opens of the
-/// same COM port from one process = "Access is denied".
+/// The watchdog is the SOLE authority on transport lifetime.
+/// There is NO mock fallback — if the device is not connected the sequencer
+/// stays in DISCONNECTED state and the UI shows "Searching…".
 ///
-/// Solution: a `tokio::sync::watch` channel carries `WatchdogCmd`.
-/// - UI sets it to `ScannerActive` before starting its scan thread.
-/// - Watchdog detects this and pauses its own polling loop until the
-///   command returns to `Idle`.
-/// - Scanner is now the sole owner of the port for its duration.
-/// - On Idle, watchdog re-probes and re-opens the port itself.
+/// ## Lifecycle
+///
+/// Phase 1 — Initial scan (runs once at startup):
+///   Scans all COM/tty ports every 2 s until a JDS6600 answers `:r\r\n`.
+///   No timeout.  Notifies the UI with `HardwareStatus` on each attempt.
+///   On success → opens SerialTransport → sends `HardwareFound` to sequencer.
+///
+/// Phase 2 — Silent liveness (steady-state):
+///   Sends a silent `:r\r\n` probe every KEEPALIVE_SECS.
+///   Does NOT log to the UI unless the probe FAILS.
+///   On failure → `HardwareLost` to sequencer + `HardwareStatus(false)` to UI
+///              → fall back to Phase 1 scan loop.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,140 +25,135 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::hal::{self, Transport};
-use crate::hal::mock::MockTransport;
-use crate::models::{LiveDeviceState, WatchdogCmd};
+use crate::models::{LiveDeviceState, MobileEvent, WatchdogCmd};
 use crate::protocol::device_state::DeviceState;
 use crate::sequencer::SequencerEvent;
 
-const LIVENESS_POLL_SECS:    u64 = 2;
-const RECONNECT_INTERVAL_SECS: u64 = 5;
-const MOCK_FALLBACK_SECS:    u64 = 8;
-/// How often to check the cmd channel while paused.
-const PAUSE_POLL_MS:         u64 = 200;
+/// How often to send a silent `:r\r\n` keepalive while device is connected.
+const KEEPALIVE_SECS:       u64 = 5;
+/// How long between port re-scan attempts if no device found.
+const RESCAN_INTERVAL_SECS: u64 = 2;
 
 pub async fn run_watchdog(
     transport:    Arc<Mutex<Box<dyn Transport>>>,
     device_state: Arc<Mutex<DeviceState>>,
     seq_tx:       mpsc::Sender<SequencerEvent>,
-    // rx half of the UI→watchdog coordination channel
     mut cmd_rx:   watch::Receiver<WatchdogCmd>,
-    // shared live state that the UI displays
     live_state:   Arc<RwLock<LiveDeviceState>>,
+    // Push HardwareStatus events to the egui UI
+    mobile_tx:    Option<std::sync::mpsc::SyncSender<MobileEvent>>,
 ) {
-    tracing::info!("[WATCHDOG] Started");
+    tracing::info!("[WATCHDOG] Started — scanning for JDS6600");
 
-    // ── Phase 1: initial scan ─────────────────────────────────────────────
-    let found = initial_scan(
-        Arc::clone(&transport),
-        Arc::clone(&device_state),
-        Arc::clone(&live_state),
-        &mut cmd_rx,
-    ).await;
-
-    if found {
-        tracing::info!("[WATCHDOG] Real hardware ready → HardwareFound");
-    } else {
-        tracing::info!("[WATCHDOG] No JDS6600 in {}s → mock mode → HardwareFound",
-            MOCK_FALLBACK_SECS);
-    }
-    let _ = seq_tx.send(SequencerEvent::HardwareFound).await;
-
-    // ── Phase 2: steady-state loop ────────────────────────────────────────
     loop {
-        // Yield to UI scanner if it has taken over.
-        pause_if_scanner_active(&mut cmd_rx).await;
+        // ── Phase 1: scan until device found ─────────────────────────────
+        let port = scan_until_found(
+            Arc::clone(&transport),
+            Arc::clone(&device_state),
+            Arc::clone(&live_state),
+            &mut cmd_rx,
+            &mobile_tx,
+        ).await;
 
-        let connected = transport.lock().unwrap().is_connected();
+        tracing::info!("[WATCHDOG] JDS6600 found on {} → HardwareFound", port);
+        notify(&mobile_tx, MobileEvent::HardwareStatus {
+            connected: true,
+            detail:    port.clone(),
+        });
+        let _ = seq_tx.send(SequencerEvent::HardwareFound).await;
 
-        if connected {
-            tokio::time::sleep(Duration::from_secs(LIVENESS_POLL_SECS)).await;
+        // ── Phase 2: silent keepalive ─────────────────────────────────────
+        loop {
+            tokio::time::sleep(Duration::from_secs(KEEPALIVE_SECS)).await;
 
-            if !transport.lock().unwrap().is_connected() {
-                tracing::warn!("[WATCHDOG] Transport lost");
+            // Yield if scanner is active (it has taken ownership of the port)
+            if *cmd_rx.borrow() == WatchdogCmd::ScannerActive {
+                continue;
+            }
+
+            let alive = silent_probe(Arc::clone(&transport)).await;
+            if !alive {
+                tracing::warn!("[WATCHDOG] Keepalive probe failed — device lost on {}", port);
+                notify(&mobile_tx, MobileEvent::HardwareStatus {
+                    connected: false,
+                    detail:    format!("lost on {}", port),
+                });
                 let _ = seq_tx.send(SequencerEvent::HardwareLost).await;
-                *transport.lock().unwrap() = Box::new(MockTransport::new());
-            }
-        } else {
-            let ports = hal::list_available_ports();
-            tracing::debug!("[WATCHDOG] Reconnect scan: {:?}", ports);
-
-            let mut recovered = false;
-            for port_name in &ports {
-                // Only try if scanner isn't active.
-                if *cmd_rx.borrow() == WatchdogCmd::ScannerActive {
-                    break;
+                // Reset transport so dispatcher stops trying to send
+                {
+                    let mut lock = transport.lock().unwrap();
+                    // Replace with a stub that reports disconnected
+                    *lock = Box::new(crate::hal::mock::MockTransport::disconnected());
                 }
-                if try_open_jds(
-                    port_name,
-                    Arc::clone(&transport),
-                    Arc::clone(&device_state),
-                    Arc::clone(&live_state),
-                ).await {
-                    let _ = seq_tx.send(SequencerEvent::HardwareRecovered).await;
-                    recovered = true;
-                    break;
-                }
+                break; // → back to Phase 1
             }
-
-            if !recovered {
-                tracing::debug!("[WATCHDOG] No JDS6600, retry in {}s", RECONNECT_INTERVAL_SECS);
-                tokio::time::sleep(Duration::from_secs(RECONNECT_INTERVAL_SECS)).await;
-            }
+            // Still alive — say nothing to the UI
+            tracing::debug!("[WATCHDOG] Keepalive OK on {}", port);
         }
     }
 }
 
-// ── Port coordination ─────────────────────────────────────────────────────
+// ── Phase 1: scan ─────────────────────────────────────────────────────────
 
-/// Block until WatchdogCmd returns to Idle, polling every PAUSE_POLL_MS.
-/// When ScannerActive: close our port so the scanner can open it.
-async fn pause_if_scanner_active(cmd_rx: &mut watch::Receiver<WatchdogCmd>) {
-    if *cmd_rx.borrow() != WatchdogCmd::ScannerActive {
-        return;
-    }
-    tracing::info!("[WATCHDOG] Scanner active – pausing port access");
-    loop {
-        tokio::time::sleep(Duration::from_millis(PAUSE_POLL_MS)).await;
-        if *cmd_rx.borrow() == WatchdogCmd::Idle {
-            tracing::info!("[WATCHDOG] Scanner done – resuming");
-            return;
-        }
-    }
-}
-
-// ── Initial scan ──────────────────────────────────────────────────────────
-
-async fn initial_scan(
+/// Scan all ports until a JDS6600 responds.  Returns the port name.
+/// This function never times out.  Notifies the UI on each scan round.
+async fn scan_until_found(
     transport:    Arc<Mutex<Box<dyn Transport>>>,
     device_state: Arc<Mutex<DeviceState>>,
     live_state:   Arc<RwLock<LiveDeviceState>>,
     cmd_rx:       &mut watch::Receiver<WatchdogCmd>,
-) -> bool {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(MOCK_FALLBACK_SECS);
-
+    mobile_tx:    &Option<std::sync::mpsc::SyncSender<MobileEvent>>,
+) -> String {
+    let mut attempt: u32 = 0;
     loop {
-        pause_if_scanner_active(cmd_rx).await;
+        // Pause if the UI scanner is using the port
+        if *cmd_rx.borrow() == WatchdogCmd::ScannerActive {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
 
         let ports = hal::list_available_ports();
-        tracing::info!("[WATCHDOG] Initial scan: {:?}", ports);
+        attempt += 1;
+
+        if ports.is_empty() {
+            tracing::debug!("[WATCHDOG] Scan #{}: no ports found", attempt);
+            notify(mobile_tx, MobileEvent::HardwareStatus {
+                connected: false,
+                detail:    "no serial ports found — check USB cable".into(),
+            });
+        } else {
+            tracing::debug!("[WATCHDOG] Scan #{}: checking {:?}", attempt, ports);
+            notify(mobile_tx, MobileEvent::HardwareStatus {
+                connected: false,
+                detail:    format!("scanning {} port(s)…", ports.len()),
+            });
+        }
 
         for port_name in &ports {
-            if try_open_jds(
-                port_name,
-                Arc::clone(&transport),
-                Arc::clone(&device_state),
-                Arc::clone(&live_state),
-            ).await {
-                return true;
+            if *cmd_rx.borrow() == WatchdogCmd::ScannerActive { break; }
+            if try_open_jds(port_name, Arc::clone(&transport), Arc::clone(&device_state), Arc::clone(&live_state)).await {
+                return port_name.clone();
             }
         }
 
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(RESCAN_INTERVAL_SECS)).await;
     }
+}
+
+// ── Silent liveness probe ─────────────────────────────────────────────────
+
+/// Send `:r\r\n` and return `true` if the device replies within 400 ms.
+/// Never logs to the UI — silent by design.
+async fn silent_probe(transport: Arc<Mutex<Box<dyn Transport>>>) -> bool {
+    tokio::task::spawn_blocking(move || {
+        let mut lock = match transport.lock() {
+            Ok(l)  => l,
+            Err(_) => return false,
+        };
+        if !lock.is_connected() { return false; }
+        if lock.write_raw(b":r\r\n").is_err() { return false; }
+        matches!(lock.read_line(400), Ok(Some(r)) if !r.trim().is_empty())
+    }).await.unwrap_or(false)
 }
 
 // ── Open + read state ─────────────────────────────────────────────────────
@@ -171,54 +167,36 @@ async fn try_open_jds(
     let pn = port_name.to_string();
     let is_jds = tokio::task::spawn_blocking(move || hal::probe_jds6600(&pn))
         .await.unwrap_or(false);
-
     if !is_jds { return false; }
 
     let pn2 = port_name.to_string();
-    let result = tokio::task::spawn_blocking(move || {
-        hal::serial::SerialTransport::open(&pn2, 500)
-    }).await;
-
-    match result {
+    match tokio::task::spawn_blocking(move || hal::serial::SerialTransport::open(&pn2, 500)).await {
         Ok(Ok(new_transport)) => {
-            tracing::info!("[WATCHDOG] Opened {} — reading device state", port_name);
+            tracing::info!("[WATCHDOG] Opened {}", port_name);
             *transport.lock().unwrap() = Box::new(new_transport);
             device_state.lock().unwrap().invalidate();
 
-            // Read current state using a separate short-lived port handle,
-            // since the transport trait doesn't expose the raw SerialPort.
+            // Best-effort state read (separate short-lived handle)
             let pn3 = port_name.to_string();
-            let read_result = tokio::task::spawn_blocking(move || {
-                match serialport::new(&pn3, 115_200)
-                    .timeout(std::time::Duration::from_millis(600))
+            if let Ok(Some(state)) = tokio::task::spawn_blocking(move || {
+                serialport::new(&pn3, 115_200)
+                    .timeout(Duration::from_millis(600))
                     .data_bits(serialport::DataBits::Eight)
                     .stop_bits(serialport::StopBits::One)
                     .parity(serialport::Parity::None)
                     .open()
-                {
-                    Ok(mut p) => hal::reader::read_device_state(p.as_mut()),
-                    Err(e) => {
-                        tracing::warn!("[WATCHDOG] State-read port open failed: {}", e);
-                        None
-                    }
-                }
-            }).await;
-            if let Ok(Some(state)) = read_result {
+                    .ok()
+                    .and_then(|mut p| hal::reader::read_device_state(p.as_mut()))
+            }).await {
                 *live_state.write().await = state;
-                tracing::info!("[WATCHDOG] Device state read successfully");
-            } else {
-                tracing::warn!("[WATCHDOG] Could not read initial device state");
             }
-
             true
         }
-        Ok(Err(e)) => {
-            tracing::warn!("[WATCHDOG] Open {}: {}", port_name, e);
-            false
-        }
-        Err(e) => {
-            tracing::error!("[WATCHDOG] spawn_blocking panic: {}", e);
-            false
-        }
+        Ok(Err(e)) => { tracing::warn!("[WATCHDOG] Open {}: {}", port_name, e); false }
+        Err(e)    => { tracing::error!("[WATCHDOG] Panic: {}", e); false }
     }
+}
+
+fn notify(tx: &Option<std::sync::mpsc::SyncSender<MobileEvent>>, ev: MobileEvent) {
+    if let Some(t) = tx { let _ = t.try_send(ev); }
 }
