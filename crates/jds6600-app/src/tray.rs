@@ -1,24 +1,61 @@
-/// System tray icon – create, poll events, update menu label dynamically.
-///
-/// ## Design
-/// `create()` returns a `TrayIcon` that must stay alive for the lifetime
-/// of the process.  We also store two things in thread-locals:
-///   • The two `MenuId`s for matching events.
-///   • The show/hide `MenuItem` itself, so we can call `set_text()` to
-///     show "Show Window" or "Hide Window" depending on current state.
-///
-/// ## Why `std::process::exit` for quit
-/// `egui::ViewportCommand::Close` is silently dropped by eframe when the
-/// window is in the hidden state (`Visible(false)`).  Calling exit(0)
-/// directly is the only reliable cross-platform quit path from a tray icon.
-///
-/// ## Keep-alive repaint
-/// When the window is hidden eframe stops scheduling repaints, so
-/// `update()` stops being called, so menu events are never polled.
-/// `poll()` always calls `ctx.request_repaint_after(50 ms)` to keep
-/// the loop alive regardless of window visibility.
+//! System tray – production-grade implementation.
+//!
+//! # Architecture
+//!
+//! The previous implementation had a fundamental dependency chain:
+//!
+//! ```text
+//! tray events processed
+//!   → only in poll()
+//!     → only called from App::update()
+//!       → only called when eframe schedules a repaint
+//!         → eframe stops repaints when window is hidden
+//! ```
+//!
+//! This means **Quit and Show/Hide silently stopped working** the moment
+//! the window was hidden.  `request_repaint_after(50ms)` was not a fix —
+//! it only works if `update()` is already being called.
+//!
+//! # Correct design
+//!
+//! ```text
+//! ┌─ OS Main Thread ──────────────────────────────────────────────────────┐
+//! │  create() → spawns tray thread, returns (TrayIcon, TrayController)    │
+//! │  eframe::run_native()                                                 │
+//! │    └─ App::new()    → TrayController::register_egui_ctx(cc.egui_ctx) │
+//! │       App::update() → TrayController::apply(ctx, &mut visible)        │
+//! │                       reads AtomicBool, applies Visible(), sets label │
+//! └───────────────────────────────────────────────────────────────────────┘
+//!
+//! ┌─ Tray Thread (dedicated) ─────────────────────────────────────────────┐
+//! │  loop {                                                                │
+//! │    try_recv MenuEvent    ← never blocks; 10 ms sleep between polls    │
+//! │    ├─ show/hide → flip AtomicBool; ctx.request_repaint() → wakes eframe│
+//! │    └─ quit      → std::process::exit(0)  ← always works              │
+//! │    try_recv TrayIconEvent                                              │
+//! │    └─ click     → same as show/hide                                   │
+//! │  }                                                                     │
+//! └───────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Why `AtomicBool` and not a channel
+//! The tray thread writes; eframe reads on every frame.  The semantics are
+//! "what is the *current desired visibility*", not "deliver every toggle
+//! event" — an AtomicBool with `Ordering::SeqCst` is the exact right tool.
+//!
+//! ## Why `Arc<Mutex<Option<egui::Context>>>` for waking eframe
+//! `egui::Context` is `Clone + Send + Sync`.  We share one clone with the
+//! tray thread so it can call `ctx.request_repaint()` to wake eframe after
+//! changing the AtomicBool.  The `Option` wrapper handles the startup window
+//! where the egui context does not yet exist.
+//!
+//! ## Why `std::process::exit(0)` for Quit
+//! `ViewportCommand::Close` is silently dropped by eframe when the window
+//! is hidden.  `exit(0)` terminates the process unconditionally.  This is
+//! the correct and only reliable quit path from a system tray.
 
-use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eframe::egui;
@@ -27,97 +64,164 @@ use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
-// ── Thread-local storage ──────────────────────────────────────────────────
+// ── Shared state between OS thread and tray thread ────────────────────────
 
-struct TrayState {
-    show_id: MenuId,
-    quit_id: MenuId,
-    /// Kept so we can call `set_text()` on it dynamically.
+/// Everything the tray thread and egui thread need to share.
+struct Shared {
+    /// Desired window visibility.
+    /// Written by tray thread via `store`.
+    /// Read by egui thread via `load`.
+    want_visible: AtomicBool,
+
+    /// Populated by the egui app in `App::new()`; read by tray thread
+    /// to call `ctx.request_repaint()` after mutating `want_visible`.
+    egui_ctx: Mutex<Option<egui::Context>>,
+}
+
+/// Handle held by the egui app.  Calls `apply()` every frame.
+pub struct TrayController {
+    shared:    Arc<Shared>,
+    show_id:   MenuId,
+    /// Kept for `set_text()` — called only from the egui (main) thread.
     show_item: MenuItem,
 }
 
-thread_local! {
-    static TRAY: RefCell<Option<TrayState>> = RefCell::new(None);
+impl TrayController {
+    /// Register the egui context so the tray thread can wake eframe.
+    /// Call once from `App::new()` with `cc.egui_ctx.clone()`.
+    pub fn register_egui_ctx(&self, ctx: egui::Context) {
+        *self.shared.egui_ctx.lock().unwrap() = Some(ctx);
+    }
+
+    /// Read desired visibility, update the menu label, apply viewport commands.
+    /// Call at the top of every `App::update()`.
+    /// Returns the new `visible` value that the app should use.
+    pub fn apply(&self, ctx: &egui::Context, current_visible: bool) -> bool {
+        let want = self.shared.want_visible.load(Ordering::SeqCst);
+
+        // Update the menu label to show what clicking WILL DO next.
+        self.show_item.set_text(if want { "Hide Window" } else { "Show Window" });
+
+        // Apply the viewport state whenever it differs from what eframe sees.
+        if want != current_visible {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(want));
+            if want {
+                // Bring the window to the foreground after un-hiding.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+
+        want
+    }
+
+    /// Call when the user hides the window via the in-window button or ✕.
+    /// Keeps the AtomicBool in sync so the menu label stays correct.
+    pub fn set_hidden(&self) {
+        self.shared.want_visible.store(false, Ordering::SeqCst);
+    }
 }
 
-// ── Public API ────────────────────────────────────────────────────────────
+// ── Factory ───────────────────────────────────────────────────────────────
 
-/// Create the tray icon.  **Must be called from the main OS thread.**
-/// Store the returned `TrayIcon` in a binding that lives until process exit.
-pub fn create() -> TrayIcon {
+/// Build the system tray icon and spawn the event-processing thread.
+///
+/// **Must be called from the OS main thread** (macOS/Windows requirement).
+///
+/// Keep the returned `TrayIcon` alive for the lifetime of the process.
+/// Pass the `TrayController` to `ServerApp::new()`.
+pub fn create() -> (TrayIcon, TrayController) {
     let icon = Icon::from_rgba(draw_icon(32), 32, 32)
         .expect("Tray icon pixel data invalid");
 
     let menu      = Menu::new();
-    let show_item = MenuItem::new("Hide Window", true, None);  // window starts visible
+    let show_item = MenuItem::new("Hide Window", true, None);
     let quit_item = MenuItem::new("Quit",        true, None);
     menu.append(&show_item).unwrap();
     menu.append(&quit_item).unwrap();
 
-    TRAY.with(|t| {
-        *t.borrow_mut() = Some(TrayState {
-            show_id:   show_item.id().clone(),
-            quit_id:   quit_item.id().clone(),
-            show_item,
-        });
+    let shared = Arc::new(Shared {
+        want_visible: AtomicBool::new(true),  // window starts visible
+        egui_ctx:     Mutex::new(None),
     });
 
-    TrayIconBuilder::new()
+    let controller = TrayController {
+        shared:    Arc::clone(&shared),
+        show_id:   show_item.id().clone(),
+        show_item,
+    };
+
+    // IDs needed by the tray thread; clone before moving into the thread.
+    let thread_shared  = Arc::clone(&shared);
+    let thread_show_id = controller.show_id.clone();
+    let thread_quit_id = quit_item.id().clone();
+
+    // ── Tray event thread ─────────────────────────────────────────────────
+    // This thread owns the event polling loop.  It has no dependency on the
+    // eframe/egui frame loop — it runs independently at all times.
+    std::thread::Builder::new()
+        .name("jds-tray-events".into())
+        .spawn(move || {
+            run_tray_event_loop(
+                thread_shared,
+                thread_show_id,
+                thread_quit_id,
+            );
+        })
+        .expect("Failed to spawn tray event thread");
+
+    let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("JDS6600 Server")
         .with_icon(icon)
         .build()
-        .expect("Failed to create tray icon")
+        .expect("Failed to create tray icon");
+
+    (tray, controller)
 }
 
-/// Poll tray events every egui frame.
-///
-/// * Updates the menu label to "Hide Window" or "Show Window" based on
-///   the current `visible` state.
-/// * Toggles `visible` when the show/hide item is clicked or the icon
-///   is directly clicked.
-/// * Exits the process immediately on Quit.
-/// * Requests a 50 ms repaint to keep the loop alive when hidden.
-pub fn poll(ctx: &egui::Context, visible: &mut bool) {
-    // Update the menu label to always reflect what clicking will DO.
-    TRAY.with(|t| {
-        if let Some(ref state) = *t.borrow() {
-            let label = if *visible { "Hide Window" } else { "Show Window" };
-            state.show_item.set_text(label);
-        }
-    });
+// ── Tray event loop (runs in its own thread forever) ──────────────────────
 
-    // Process menu events.
-    let (show_id, quit_id) = TRAY.with(|t| {
-        t.borrow().as_ref().map(|s| (s.show_id.clone(), s.quit_id.clone()))
-            .expect("call tray::create() first")
-    });
-
-    while let Ok(ev) = MenuEvent::receiver().try_recv() {
-        if ev.id == show_id {
-            *visible = !*visible;
-            if *visible {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
-        } else if ev.id == quit_id {
-            // ViewportCommand::Close is ignored when the window is hidden.
-            // std::process::exit(0) is the only reliable path.
-            std::process::exit(0);
-        }
-    }
-
-    // Direct click on the tray icon toggles visibility.
-    while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-        if let TrayIconEvent::Click { .. } = ev {
-            *visible = !*visible;
-            if *visible {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+fn run_tray_event_loop(
+    shared:    Arc<Shared>,
+    show_id:   MenuId,
+    quit_id:   MenuId,
+) {
+    loop {
+        // ── Menu events (right-click → item selected) ─────────────────
+        while let Ok(ev) = MenuEvent::receiver().try_recv() {
+            if ev.id == show_id {
+                toggle_visibility(&shared);
+            } else if ev.id == quit_id {
+                // Unconditional process exit — no dependency on eframe.
+                std::process::exit(0);
             }
         }
-    }
 
-    // Keep the egui event loop alive even when the window is hidden.
-    ctx.request_repaint_after(Duration::from_millis(50));
+        // ── Tray icon events (direct click on the icon) ───────────────
+        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::Click { .. } = ev {
+                toggle_visibility(&shared);
+            }
+        }
+
+        // 10 ms poll interval.  Imperceptible to humans (<1 frame @ 60 fps)
+        // and negligible CPU cost (~0.01% of one core).
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn toggle_visibility(shared: &Arc<Shared>) {
+    let current = shared.want_visible.load(Ordering::SeqCst);
+    shared.want_visible.store(!current, Ordering::SeqCst);
+
+    // Wake eframe so App::update() runs and picks up the new AtomicBool value.
+    // If the context is not yet registered, the wake is skipped — eframe
+    // is still initialising and will pick up the correct value on its own.
+    if let Ok(guard) = shared.egui_ctx.lock() {
+        if let Some(ctx) = guard.as_ref() {
+            ctx.request_repaint();
+        }
+    }
 }
 
 // ── Procedural icon ────────────────────────────────────────────────────────

@@ -85,7 +85,7 @@ fn main() -> eframe::Result<()> {
             .expect("Backend thread failed");
     }
 
-    let _tray = tray::create();
+    let (_tray, tray_controller) = tray::create();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -100,7 +100,7 @@ fn main() -> eframe::Result<()> {
         "JDS6600 Server",
         options,
         Box::new(move |cc| Box::new(ui::ServerApp::new(
-            cc, ws_url, quick_tx,
+            cc, ws_url, tray_controller, quick_tx,
         ))),
     )
 }

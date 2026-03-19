@@ -36,7 +36,7 @@ use jds6600_core::{
     protocol::commands::GeneratorCommand,
 };
 
-use crate::tray;
+use crate::tray::TrayController;
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -78,7 +78,9 @@ struct ChannelSent {
 pub struct ServerApp {
     ws_url:      String,
     qr_texture:  Option<TextureHandle>,
+    /// Current window visibility state — source of truth for eframe.
     visible:     bool,
+    tray:        TrayController,
     quick_tx:    QuickCmdSender,
 
     // Control state (what we last sent)
@@ -92,14 +94,19 @@ pub struct ServerApp {
 
 impl ServerApp {
     pub fn new(
-        _cc:      &eframe::CreationContext<'_>,
+        cc:       &eframe::CreationContext<'_>,
         ws_url:   String,
+        tray:     TrayController,
         quick_tx: QuickCmdSender,
     ) -> Self {
+        // Register the egui context immediately so the tray thread can wake
+        // eframe as soon as the first event arrives.
+        tray.register_egui_ctx(cc.egui_ctx.clone());
         Self {
             ws_url,
             qr_texture:       None,
             visible:          true,
+            tray,
             quick_tx,
             selected_channel: 1,
             sent:             [ChannelSent::default(), ChannelSent::default()],
@@ -158,13 +165,19 @@ impl ServerApp {
 
 impl eframe::App for ServerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        tray::poll(ctx, &mut self.visible);
+        // TrayController::apply() reads the AtomicBool set by the tray thread,
+        // applies Visible()/Focus viewport commands, and updates the menu label.
+        // This is the ONLY place visibility is mutated from the egui side.
+        self.visible = self.tray.apply(ctx, self.visible);
 
+        // Intercept the window ✕ button: hide rather than quit.
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.tray.set_hidden();     // keep AtomicBool in sync
             self.visible = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.visible));
+
         if !self.visible { return; }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -206,7 +219,11 @@ fn render_header(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut ServerApp) {
         ui.label(RichText::new("● Server running")
             .color(egui::Color32::from_rgb(55, 210, 55)).strong());
         ui.add_space(6.0);
-        if ui.button("  Minimize to Tray  ").clicked() { app.visible = false; }
+        if ui.button("  Minimize to Tray  ").clicked() {
+                app.tray.set_hidden();
+                app.visible = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
         ui.add_space(4.0);
     });
 }
