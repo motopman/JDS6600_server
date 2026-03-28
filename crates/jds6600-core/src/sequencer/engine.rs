@@ -92,11 +92,33 @@ impl Context {
         self.sequence.as_ref()?.blocks.get(self.pointer)
     }
 
-    fn has_next(&self) -> bool {
+    /// Last index of the current "time slot" — consecutive blocks sharing
+    /// the same duration_ms.  All are applied together before the timer fires.
+    fn slot_end(&self) -> usize {
+        let dur = match self.current_block() {
+            Some(b) => b.duration_ms,
+            None    => return self.pointer,
+        };
+        let blocks = match &self.sequence {
+            Some(s) => &s.blocks,
+            None    => return self.pointer,
+        };
+        let mut end = self.pointer;
+        while end + 1 < blocks.len() && blocks[end + 1].duration_ms == dur {
+            end += 1;
+        }
+        end
+    }
+
+    /// True if there are blocks after the current slot.
+    fn has_next_slot(&self) -> bool {
+        let end = self.slot_end();
         self.sequence.as_ref()
-            .map(|s| self.pointer + 1 < s.blocks.len())
+            .map(|s| end + 1 < s.blocks.len())
             .unwrap_or(false)
     }
+
+    fn has_next(&self) -> bool { self.has_next_slot() }
 
     fn time_remaining(&self) -> Duration {
         // If paused, return the saved remainder.
@@ -245,9 +267,10 @@ impl SequencerEngine {
 
             // ── RUNNING ───────────────────────────────────────────────
             (SequencerState::Running, SequencerEvent::Tick) => {
-                if self.ctx.has_next() {
-                    self.ctx.pointer += 1;
-                    match self.apply_current_block().await {
+                if self.ctx.has_next_slot() {
+                    // Advance past ALL blocks in the just-finished slot
+                    self.ctx.pointer = self.ctx.slot_end() + 1;
+                    match self.apply_current_slot().await {
                         Ok(())  => None,                                   // stay RUNNING
                         Err(e)  => {
                             self.dispatcher.emergency_stop();
@@ -411,47 +434,73 @@ impl SequencerEngine {
         self.apply_current_block().await
     }
 
-    async fn apply_current_block(&mut self) -> Result<(), String> {
-        let block = self.ctx.current_block()
-            .ok_or_else(|| "Execution pointer past end of sequence".to_string())?
-            .clone();
-
+    /// Apply all blocks in the current time slot (same duration_ms), then
+    /// start the shared timer.
+    ///
+    /// Execution order within the slot:
+    ///   For each block: Waveform, Frequency, Amplitude, Offset, Duty
+    ///   (no per-block SetOutputEnable — avoids toggling outputs mid-slot)
+    ///   After all channel params: ONE SetOutputEnable combining all channels
+    ///   Then start timer.
+    async fn apply_current_slot(&mut self) -> Result<(), String> {
+        let slot_start = self.ctx.pointer;
+        let slot_end   = self.ctx.slot_end();
         let block_total = self.ctx.sequence.as_ref().map(|s| s.blocks.len()).unwrap_or(1);
-        tracing::info!("[SEQUENCER] → Block {}/{} | {}Hz {} amp={}V dur={}ms",
-            self.ctx.pointer + 1, block_total, block.frequency, block.waveform,
-            block.amplitude, block.duration_ms);
 
-        self.notify(MobileEvent::BlockStarted {
-            block_index: self.ctx.pointer,
-            block_total,
-            channel:     block.channel,
-            frequency:   block.frequency,
-            waveform:    block.waveform.to_string(),
-            amplitude:   block.amplitude,
-            duration_ms: block.duration_ms,
-        });
+        let blocks: Vec<SequenceBlock> = {
+            let seq = self.ctx.sequence.as_ref()
+                .ok_or("No sequence")?;
+            seq.blocks[slot_start..=slot_end].to_vec()
+        };
 
-        // Waveform first – avoids transient wrong-waveform output.
-        let cmds: &[GeneratorCommand] = &[
-            GeneratorCommand::SetWaveform  { channel: block.channel, waveform: block.waveform.clone() },
-            GeneratorCommand::SetFrequency { channel: block.channel, hz:       block.frequency },
-            GeneratorCommand::SetAmplitude { channel: block.channel, volts:    block.amplitude },
-            GeneratorCommand::SetOffset    { channel: block.channel, volts:    block.offset    },
-            GeneratorCommand::SetDuty      { channel: block.channel, percent:  block.duty      },
-            GeneratorCommand::SetOutputEnable {
-                ch1: block.channel == 1,
-                ch2: block.channel == 2,
-            },
-        ];
+        tracing::info!("[SEQUENCER] → Slot [{}-{}] ({} channel(s)) dur={}ms",
+            slot_start + 1, slot_end + 1, blocks.len(),
+            blocks.first().map(|b| b.duration_ms).unwrap_or(0));
 
-        for cmd in cmds {
-            self.dispatcher.send(cmd.clone()).await
-                .map_err(|e| format!("Dispatcher error: {}", e))?;
+        // Track which output channels are active in this slot
+        let mut ch1_on = false;
+        let mut ch2_on = false;
+
+        for (i, block) in blocks.iter().enumerate() {
+            self.notify(MobileEvent::BlockStarted {
+                block_index: slot_start + i,
+                block_total,
+                channel:     block.channel,
+                frequency:   block.frequency,
+                waveform:    block.waveform.to_string(),
+                amplitude:   block.amplitude,
+                duration_ms: block.duration_ms,
+            });
+
+            // Channel params — no SetOutputEnable yet
+            let cmds: &[GeneratorCommand] = &[
+                GeneratorCommand::SetWaveform  { channel: block.channel, waveform: block.waveform.clone() },
+                GeneratorCommand::SetFrequency { channel: block.channel, hz:       block.frequency },
+                GeneratorCommand::SetAmplitude { channel: block.channel, volts:    block.amplitude },
+                GeneratorCommand::SetOffset    { channel: block.channel, volts:    block.offset    },
+                GeneratorCommand::SetDuty      { channel: block.channel, percent:  block.duty      },
+            ];
+            for cmd in cmds {
+                self.dispatcher.send(cmd.clone()).await
+                    .map_err(|e| format!("Dispatcher error: {}", e))?;
+            }
+
+            if block.channel == 1 { ch1_on = true; }
+            if block.channel == 2 { ch2_on = true; }
         }
+
+        // Single SetOutputEnable after all channel params — enables all active channels
+        self.dispatcher.send(GeneratorCommand::SetOutputEnable { ch1: ch1_on, ch2: ch2_on }).await
+            .map_err(|e| format!("Dispatcher error: {}", e))?;
 
         self.ctx.block_start      = Some(Instant::now());
         self.ctx.paused_remaining = None;
         Ok(())
+    }
+
+    // Keep the old single-block name as a thin alias for clarity
+    async fn apply_current_block(&mut self) -> Result<(), String> {
+        self.apply_current_slot().await
     }
 
     async fn disable_outputs(&self) {
@@ -490,5 +539,95 @@ impl SequencerEngine {
         if let Ok(json) = serde_json::to_string(&OutgoingMessage::ServerStatus(payload)) {
             let _ = self.status_tx.send(json);
         }
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+
+    fn make_block(channel: u8, duration_ms: u64) -> SequenceBlock {
+        SequenceBlock {
+            id:          format!("test-ch{}", channel),
+            channel,
+            frequency:   1_000_000.0,
+            amplitude:   20.0,
+            offset:      0.0,
+            duty:        50.0,
+            waveform:    crate::models::Waveform::Sine,
+            duration_ms,
+        }
+    }
+
+    /// Two blocks with the same duration → same slot.
+    #[test]
+    fn same_duration_groups_into_one_slot() {
+        let mut ctx = Context::new();
+        ctx.sequence = Some(crate::models::Sequence {
+            sequence_name: "test".into(),
+            blocks: vec![
+                make_block(1, 1_800_000),
+                make_block(2, 1_800_000),
+            ],
+        });
+        ctx.pointer = 0;
+
+        // Both blocks share the same duration → slot covers indices 0 and 1
+        assert_eq!(ctx.slot_end(), 1,
+            "both 1800s blocks should be in the same slot");
+
+        // After the slot there are no more blocks
+        assert!(!ctx.has_next_slot(),
+            "no blocks after slot [0,1]");
+    }
+
+    /// Two blocks with different durations → different slots.
+    #[test]
+    fn different_duration_makes_separate_slots() {
+        let mut ctx = Context::new();
+        ctx.sequence = Some(crate::models::Sequence {
+            sequence_name: "test".into(),
+            blocks: vec![
+                make_block(1,   600_000),
+                make_block(2, 1_200_000),
+            ],
+        });
+        ctx.pointer = 0;
+
+        // Block 0 has a unique duration → slot is just [0]
+        assert_eq!(ctx.slot_end(), 0,
+            "600s block should be its own slot");
+
+        // There is a next slot (block 1)
+        assert!(ctx.has_next_slot());
+
+        // Advance to block 1
+        ctx.pointer = ctx.slot_end() + 1;
+        assert_eq!(ctx.slot_end(), 1,
+            "1200s block is its own slot");
+        assert!(!ctx.has_next_slot());
+    }
+
+    /// Three blocks: two share a duration, one is unique.
+    #[test]
+    fn mixed_sequence_slots() {
+        let mut ctx = Context::new();
+        ctx.sequence = Some(crate::models::Sequence {
+            sequence_name: "test".into(),
+            blocks: vec![
+                make_block(1, 1_800_000), // slot 0: [0,1]
+                make_block(2, 1_800_000), //
+                make_block(1,   600_000), // slot 1: [2]
+            ],
+        });
+        ctx.pointer = 0;
+
+        assert_eq!(ctx.slot_end(), 1);
+        assert!(ctx.has_next_slot());
+
+        ctx.pointer = ctx.slot_end() + 1; // advance to slot 1
+        assert_eq!(ctx.pointer, 2);
+        assert_eq!(ctx.slot_end(), 2);
+        assert!(!ctx.has_next_slot());
     }
 }

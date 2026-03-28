@@ -1,7 +1,13 @@
-[workspace]
-members = [
-    "crates/jds6600-core",
-    "crates/jds6600-app",
-    "crates/jdsctl",
-]
-resolver = "2"
+[package]
+name = "jdsctl"
+version = "0.1.0"
+edition = "2021"
+description = "Protocol Scanner & CLI for the JDS6600 signal generator"
+rust-version = "1.75"
+
+[[bin]]
+name = "jdsctl"
+path = "src/main.rs"
+
+[dependencies]
+serialport = "4"
